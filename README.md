@@ -59,7 +59,7 @@ Handler 返回错误时：
 | 后端 | 创建 | Claim | Cancel | 说明 |
 |---|---|---|---|---|
 | Memory | `NewMemory()` | 无到期任务时阻塞到 ctx 取消 | 支持 | 进程内，不跨进程 |
-| Redis | `NewRedis(cmd, zsetKey)` | 立即返回，靠 `WithPollInterval` 轮询 | 支持 | 单 ZSET，ZREM 竞争领取 |
+| Redis | `NewRedis(cmd, zsetKey)` | 立即返回，靠 `WithPollInterval` 轮询 | 支持 | 单 ZSET，Lua 一次领取（ZRANGEBYSCORE + ZREM） |
 | AMQP | `NewAMQP(conn, AMQPConfig{...})` | 从队列消费；第一条可阻塞 | **不支持**（`ErrCancelUnsupported`） | 发布与消费各开一条 Channel；内部声明 x-delayed-message；领取后立刻 Ack |
 
 Redis 示例（Claim 不阻塞，需要 `WithPollInterval` 轮询）：
@@ -79,7 +79,7 @@ _ = t.SetEvent(time.Now().Add(time.Minute), params)
 _ = t.DelEvent(params)
 ```
 
-`NewRedis` 的第二个参数是 ZSET 名。多副本用同一个 key 即可竞争领取。
+`NewRedis` 的第二个参数是 ZSET 名。
 
 AMQP 示例（首次使用时内部打开 Channel，并声明 x-delayed-message 交换机、队列并绑定；`DelEvent` 不支持）：
 
@@ -102,6 +102,24 @@ _ = t.SetEvent(time.Now().Add(time.Minute), params)
 
 需要 RabbitMQ 插件 `rabbitmq_delayed_message_exchange`。`Queue` 为空时消费 `RoutingKey`。
 
+## 多实例消费
+
+Handler 能力不够时，优先加消费进程（或加单机并发），不要改 Store 语义。
+
+| 后端 | 多进程 `Start` | 说明 |
+|---|---|---|
+| Redis | 同一 `zsetKey` | 多进程竞争领取，同一条任务只会被一个进程拿到 |
+| AMQP | 同一 Exchange / Queue | 多消费者竞争投递 |
+| Memory | **仅单进程** | 任务在进程内堆里，多开服务不共享 |
+
+单机调参：
+
+- `WithConcurrency`：同时执行 Handle 的上限（默认 32）
+- `WithBatchSize`：单次 Claim 条数（默认 32）
+- `WithPollInterval`：Claim 无任务或失败后的等待（默认 200ms）。**Redis Claim 不阻塞，主要靠此项轮询**；Memory / AMQP 的 Claim 会阻塞，此项影响较小
+
+副本加到 Handler / 下游打满即可。Redis 每个进程都会按 `WithPollInterval` 扫 ZSET，空转副本过多会先打满 Redis。
+
 ## 任务身份
 
 Cancel 按 Key 匹配。Key = `Event` + 两个 ASCII 单元分隔符 (`\x1f\x1f`) + JSON 载荷。JSON 字段顺序与结构体声明一致。
@@ -115,7 +133,7 @@ Redis Claim 用该 Key 还原 Kind / Payload。AMQP 消息体里同时带 Key、
 | `WithHandlers` | 无 | 注册到期 Handler |
 | `WithFailPolicy` | `FailDiscard` | 仅 Handler 失败：抛弃或重入队 |
 | `WithBus` | 不启用 | `SetEvent` / `DelEvent` 走内存通道 |
-| `WithConcurrency` | 32 | 同时执行 Handle 的上限 |
+| `WithConcurrency` | 32 | 同时执行 Handle 的上限；领取与 Handle 重叠，不必等整批结束 |
 | `WithBatchSize` | 32 | 单次 Claim 条数 |
 | `WithPollInterval` | 200ms | Claim 无任务或失败后的等待。Redis 主要靠此项轮询 |
 | `WithLogger` / `WithLogLevel` | stderr Info | 日志 |

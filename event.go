@@ -77,7 +77,7 @@ func (h *boundHandler[P]) NewParams() Params {
 func (h *boundHandler[P]) Handle(ctx context.Context, p Params) error {
 	t, ok := p.(P)
 	if !ok {
-		return errors.Errorf("params type mismatch want %T got %T", h.proto, p)
+		return errors.Wrapf(ErrParamsTypeMismatch, "want %T got %T", h.proto, p)
 	}
 	return h.handler(ctx, t)
 }
@@ -97,7 +97,10 @@ func encodeParams(p Params) (string, error) {
 	return s, nil
 }
 
-// decodeParams 解码到已克隆的指针参数
+// decodeParams 解码到已克隆的指针参数。失败时包装 ErrUnmarshalParams。
 func decodeParams(payload string, p Params) error {
-	return errors.WithStack(jsonAPI.UnmarshalFromString(payload, p))
+	if err := jsonAPI.UnmarshalFromString(payload, p); err != nil {
+		return errors.Wrap(ErrUnmarshalParams, err.Error())
+	}
+	return nil
 }

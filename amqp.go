@@ -370,7 +370,7 @@ func (b *amqpBroker) onConsumeClosed(out []Task) ([]Task, error) {
 	if len(out) > 0 {
 		return out, nil
 	}
-	return nil, errors.New("amqp consume channel closed")
+	return nil, ErrConsumeClosed
 }
 
 // amqpPublish 一次延迟投递。

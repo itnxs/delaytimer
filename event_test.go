@@ -3,6 +3,8 @@ package delaytimer
 import (
 	"context"
 	"testing"
+
+	"github.com/pkg/errors"
 )
 
 func TestBindHandleRoundTrip(t *testing.T) {
@@ -57,6 +59,8 @@ func TestEncodeDecodeParams(t *testing.T) {
 	}
 	if err := decodeParams("not-json", &sampleParams{}); err == nil {
 		t.Fatal("expected decode error")
+	} else if !errors.Is(err, ErrUnmarshalParams) {
+		t.Fatalf("want ErrUnmarshalParams, got %v", err)
 	}
 }
 
@@ -81,8 +85,8 @@ func TestEncodeParamsFieldOrderStable(t *testing.T) {
 func TestHandleTypeMismatch(t *testing.T) {
 	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error { return nil })
 	err := h.Handle(context.Background(), &orderedParams{})
-	if err == nil {
-		t.Fatal("expected type mismatch")
+	if !errors.Is(err, ErrParamsTypeMismatch) {
+		t.Fatalf("want ErrParamsTypeMismatch, got %v", err)
 	}
 }
 

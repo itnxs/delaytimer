@@ -17,10 +17,35 @@ type redisZSet interface {
 	ZAdd(ctx context.Context, key string, members ...redis.Z) *redis.IntCmd
 	ZAddNX(ctx context.Context, key string, members ...redis.Z) *redis.IntCmd
 	ZRem(ctx context.Context, key string, members ...interface{}) *redis.IntCmd
-	ZRangeByScoreWithScores(ctx context.Context, key string, opt *redis.ZRangeBy) *redis.ZSliceCmd
+	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd
 }
 
-// Redis 单 ZSET 延迟任务。Claim 用 ZREM 竞争领取，无到期任务时立即返回空，不阻塞。
+// redisClaimLua 一次领取到期 member：ZRANGEBYSCORE + ZREM。
+// ARGV[1] 为毫秒时间；空字符串则用 Redis TIME。ARGV[2] 为条数。
+const redisClaimLua = `
+local key = KEYS[1]
+local now = ARGV[1]
+local n = tonumber(ARGV[2])
+if n == nil or n < 1 then
+  n = 1
+end
+if now == false or now == nil or now == '' then
+  local t = redis.call('TIME')
+  now = tostring(tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000))
+end
+local items = redis.call('ZRANGEBYSCORE', key, '-inf', now, 'WITHSCORES', 'LIMIT', 0, n)
+if #items == 0 then
+  return items
+end
+local members = {}
+for i = 1, #items, 2 do
+  members[#members + 1] = items[i]
+end
+redis.call('ZREM', key, unpack(members))
+return items
+`
+
+// Redis 单 ZSET 延迟任务。Claim 用一条 Lua 竞争领取，无到期任务时立即返回空，不阻塞。
 type Redis struct {
 	cmd           redisZSet
 	key           string
@@ -45,17 +70,17 @@ func WithRedisClock(c Clock) RedisOption {
 // cmd 为空或 key 为空时 panic。
 func NewRedis(cmd redis.Cmdable, key string, opts ...RedisOption) *Redis {
 	if cmd == nil {
-		panic(errors.New("redis commands is nil"))
+		panic(ErrNilRedis)
 	}
 	return newRedis(cmd, key, opts...)
 }
 
 func newRedis(cmd redisZSet, key string, opts ...RedisOption) *Redis {
 	if cmd == nil {
-		panic(errors.New("redis commands is nil"))
+		panic(ErrNilRedis)
 	}
 	if key == "" {
-		panic(errors.New("redis key is empty"))
+		panic(ErrEmptyRedisKey)
 	}
 	r := &Redis{
 		cmd:           cmd,
@@ -79,33 +104,20 @@ func (r *Redis) Cancel(ctx context.Context, key string) error {
 	return r.cmd.ZRem(ctx, r.key, key).Err()
 }
 
-// Claim 领取到期任务；ZREM 返回 1 的副本才算领到。无任务时立即返回，不阻塞。
+// Claim 领取到期任务。一条 Lua 完成 ZRANGEBYSCORE + ZREM，无任务时立即返回空。
 func (r *Redis) Claim(ctx context.Context, n int) ([]Task, error) {
 	if n < 1 {
 		n = 1
 	}
-	nowS := strconv.FormatInt(r.nowMilli(ctx), 10)
-	items, err := r.cmd.ZRangeByScoreWithScores(ctx, r.key, &redis.ZRangeBy{
-		Min:   "-inf",
-		Max:   nowS,
-		Count: int64(n),
-	}).Result()
+	var nowArg interface{} = ""
+	if !r.useServerTime {
+		nowArg = strconv.FormatInt(r.clock().UnixMilli(), 10)
+	}
+	raw, err := r.cmd.Eval(ctx, redisClaimLua, []string{r.key}, nowArg, n).Result()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Task, 0, len(items))
-	for _, item := range items {
-		member, _ := item.Member.(string)
-		removed, err := r.cmd.ZRem(ctx, r.key, member).Result()
-		if err != nil {
-			return nil, err
-		}
-		if removed != 1 {
-			continue
-		}
-		out = append(out, redisMember(member).task(item.Score))
-	}
-	return out, nil
+	return tasksFromClaimEval(raw)
 }
 
 // Ack 领取时已从 ZSET 删除
@@ -156,5 +168,52 @@ func (m redisMember) task(score float64) Task {
 		Kind:    kind,
 		Payload: payload,
 		At:      time.UnixMilli(int64(score)),
+	}
+}
+
+func tasksFromClaimEval(raw any) ([]Task, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, errors.Errorf("redis claim: unexpected type %T", raw)
+	}
+	out := make([]Task, 0, len(arr)/2)
+	for i := 0; i+1 < len(arr); i += 2 {
+		member := redisEvalString(arr[i])
+		score := redisEvalInt64(arr[i+1])
+		out = append(out, redisMember(member).task(float64(score)))
+	}
+	return out, nil
+}
+
+func redisEvalString(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case []byte:
+		return string(x)
+	default:
+		return ""
+	}
+}
+
+func redisEvalInt64(v any) int64 {
+	switch x := v.(type) {
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	case float64:
+		return int64(x)
+	case string:
+		n, _ := strconv.ParseInt(x, 10, 64)
+		return n
+	case []byte:
+		n, _ := strconv.ParseInt(string(x), 10, 64)
+		return n
+	default:
+		return 0
 	}
 }

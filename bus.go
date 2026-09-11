@@ -211,12 +211,12 @@ func (t *Timer) newTask(at time.Time, p Params, payload string) Task {
 func (t *Timer) handleSet(i any) {
 	p, ok := i.(*SetEventParam)
 	if !ok || p == nil || p.Params == nil {
-		t.logger.WithField("value", i).Error("set event param error")
+		t.logger.WithField("value", i).Error("invalid set event param")
 		return
 	}
 
 	if err := t.persistSet(p.Time, p.Params); err != nil {
-		t.logger.WithError(err).Error("set event failed")
+		t.logger.WithError(err).Error("set event persist failed")
 	}
 }
 
@@ -224,12 +224,12 @@ func (t *Timer) handleSet(i any) {
 func (t *Timer) handleDel(i any) {
 	p, ok := i.(*DelEventParam)
 	if !ok || p == nil || p.Params == nil {
-		t.logger.WithField("value", i).Error("del event param error")
+		t.logger.WithField("value", i).Error("invalid del event param")
 		return
 	}
 
 	if err := t.persistDel(p.Params); err != nil {
-		t.logger.WithError(err).Error("del event failed")
+		t.logger.WithError(err).Error("del event persist failed")
 	}
 }
 
@@ -252,10 +252,10 @@ func observe(t *Timer, events rxgo.Observable, handle func(any), name string) rx
 			handle(i)
 		},
 		func(err error) {
-			t.logger.WithError(err).Errorf("observe %s error", name)
+			t.logger.WithError(err).WithField("op", name).Error("bus observe failed")
 		},
 		func() {
-			t.logger.Infof("observe %s end", name)
+			t.logger.WithField("op", name).Debug("bus observe stopped")
 		},
 	)
 }

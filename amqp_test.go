@@ -457,8 +457,8 @@ func TestAMQPClaimClosedChannel(t *testing.T) {
 	close(deliveries)
 	a := amqpStore(&fakeAMQPChannel{deliveries: deliveries}, testAMQPConfig())
 	_, err := a.Claim(context.Background(), 1)
-	if err == nil {
-		t.Fatal("expected closed channel error")
+	if !errors.Is(err, ErrConsumeClosed) {
+		t.Fatalf("want ErrConsumeClosed, got %v", err)
 	}
 }
 

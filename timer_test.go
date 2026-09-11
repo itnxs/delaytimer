@@ -399,6 +399,16 @@ func TestTimerCloseClosesAMQPChannels(t *testing.T) {
 	}
 }
 
+func TestDispatchAckFailed(t *testing.T) {
+	store := &fakeStore{ackErr: errors.New("ack boom")}
+	timer := New(store, WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	err := timer.dispatch(context.Background(), sampleTaskAt(time.Unix(1, 0)))
+	if !errors.Is(err, ErrAckFailed) {
+		t.Fatalf("want ErrAckFailed, got %v", err)
+	}
+}
+
 func TestDispatchPanicReturnsError(t *testing.T) {
 	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
 		panic("boom")
@@ -433,4 +443,45 @@ func TestTimerRunConcurrentDispatch(t *testing.T) {
 		_, _, ackN, _ := store.snapshot()
 		return ackN == 8
 	})
+}
+
+func TestTimerClaimsWhileHandlersRun(t *testing.T) {
+	block := make(chan struct{})
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
+		<-block
+		return nil
+	})
+	store := &fakeStore{claims: []Task{sampleTaskAt(time.Unix(1, 0)), sampleTaskAt(time.Unix(2, 0))}}
+	timer := New(store, WithHandlers(h), WithLogger(silentLogger()), WithPollInterval(time.Millisecond), WithConcurrency(2), WithBatchSize(1))
+	t.Cleanup(func() {
+		close(block)
+		timer.Close()
+	})
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 2*time.Second, func() bool { return store.claimCount() >= 2 })
+}
+
+func TestTimerCloseWaitsForAsyncDispatch(t *testing.T) {
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
+		close(started)
+		time.Sleep(40 * time.Millisecond)
+		close(finished)
+		return nil
+	})
+	store := &fakeStore{claims: []Task{sampleTaskAt(time.Unix(1, 0))}}
+	timer := New(store, WithHandlers(h), WithLogger(silentLogger()), WithPollInterval(time.Millisecond), WithConcurrency(1), WithBatchSize(1))
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	timer.Close()
+	select {
+	case <-finished:
+	default:
+		t.Fatal("Close returned before handler finished")
+	}
 }

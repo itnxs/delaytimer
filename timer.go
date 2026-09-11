@@ -8,15 +8,15 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/reactivex/rxgo/v2"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sync/errgroup"
 )
 
 // defaultLogger 默认日志
 func defaultLogger() logrus.FieldLogger {
 	l := logrus.New()
 	l.SetOutput(os.Stderr)
-	l.SetLevel(logrus.InfoLevel)
+	l.SetLevel(logrus.ErrorLevel)
 	return l.WithField("pkg", "delaytimer")
 }
 
@@ -140,10 +140,10 @@ func (t *Timer) persistSet(at time.Time, p Params) error {
 	}
 
 	t.logger.WithFields(logrus.Fields{
-		"time": task.At,
-		"name": task.Kind,
+		"at":   task.At,
+		"kind": task.Kind,
 		"key":  task.Key,
-	}).Info("set timer event")
+	}).Info("set event")
 	return nil
 }
 
@@ -157,9 +157,9 @@ func (t *Timer) persistDel(p Params) error {
 		return err
 	}
 	t.logger.WithFields(logrus.Fields{
-		"name": p.Event(),
+		"kind": p.Event(),
 		"key":  key,
-	}).Info("del timer event")
+	}).Info("del event")
 	return nil
 }
 
@@ -236,44 +236,65 @@ func (t *Timer) bindHandlers() {
 	}
 }
 
+// loop 领取任务并交给 RxGo 并发 Handle。发送阻塞形成背压，在途约等于 concurrency。
 func (t *Timer) loop(ctx context.Context) error {
-	var eg errgroup.Group
-	eg.SetLimit(t.concurrency)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+	ch := make(chan rxgo.Item)
+	go func() {
+		defer close(ch)
+		t.produceClaims(ctx, ch)
+	}()
+	<-rxgo.FromChannel(ch, rxgo.WithBackPressureStrategy(rxgo.Block)).
+		Map(
+			func(_ context.Context, i interface{}) (interface{}, error) {
+				task, ok := i.(Task)
+				if !ok {
+					return i, nil
+				}
+				if err := t.dispatch(ctx, task); err != nil {
+					fields := logrus.Fields{
+						"kind": task.Kind,
+						"key":  task.Key,
+					}
+					if errors.Is(err, ErrUnknownKind) || errors.Is(err, ErrUnmarshalParams) {
+						t.logger.WithError(err).WithFields(fields).Warn("task skipped")
+					} else {
+						t.logger.WithError(err).WithFields(fields).Error("task dispatch failed")
+					}
+				}
+				return i, nil
+			},
+			rxgo.WithPool(t.concurrency),
+			rxgo.WithErrorStrategy(rxgo.ContinueOnError),
+			rxgo.WithBackPressureStrategy(rxgo.Block),
+		).
+		ForEach(func(interface{}) {}, func(err error) {
+			t.logger.WithError(err).Error("consume stream failed")
+		}, func() {})
+	return ctx.Err()
+}
 
+func (t *Timer) produceClaims(ctx context.Context, next chan<- rxgo.Item) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
 		tasks, err := t.store.Claim(ctx, t.batchSize)
 		if err != nil {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return
 			}
 			t.logger.WithError(err).Error("claim failed")
 		}
-
 		if err != nil || len(tasks) == 0 {
 			if !t.sleep(ctx) {
-				return ctx.Err()
+				return
 			}
 			continue
 		}
-
-		for i := 0; i < len(tasks); i++ {
-			task := tasks[i]
-			eg.Go(func() error {
-				if err := t.dispatch(ctx, task); err != nil {
-					t.logger.WithError(err).WithFields(logrus.Fields{
-						"kind": task.Kind,
-						"key":  task.Key,
-					}).Error("task dispatch failed")
-				}
-				return nil
-			})
-		}
-
-		if err := eg.Wait(); err != nil {
-			return errors.WithStack(err)
+		for i := range tasks {
+			if !rxgo.Of(tasks[i]).SendContext(ctx, next) {
+				return
+			}
 		}
 	}
 }
@@ -284,7 +305,7 @@ func (t *Timer) dispatch(ctx context.Context, task Task) (err error) {
 	defer func() {
 		if rev := recover(); rev != nil {
 			t.logger.WithFields(logrus.Fields{
-				"error": rev,
+				"panic": rev,
 				"stack": string(debug.Stack()),
 			}).Error("task dispatch panic")
 			err = errors.Errorf("task dispatch panic: %v", rev)
@@ -292,7 +313,7 @@ func (t *Timer) dispatch(ctx context.Context, task Task) (err error) {
 	}()
 
 	if err := t.store.Ack(ctx, task); err != nil {
-		return errors.New("task ack failed")
+		return errors.Wrap(ErrAckFailed, err.Error())
 	}
 
 	h, ok := t.handlers[Event(task.Kind)]
@@ -301,8 +322,11 @@ func (t *Timer) dispatch(ctx context.Context, task Task) (err error) {
 	}
 
 	inst := h.NewParams()
-	if !isPointerParams(inst) {
+	if inst == nil {
 		return errors.WithStack(ErrNilParam)
+	}
+	if !isPointerParams(inst) {
+		return errors.Wrapf(ErrNotPointerParams, "%T", inst)
 	}
 
 	if err := decodeParams(task.Payload, inst); err != nil {

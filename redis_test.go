@@ -12,10 +12,14 @@ import (
 )
 
 type memZSet struct {
-	mu    sync.Mutex
-	key   string
-	items map[string]int64
-	now   time.Time
+	mu      sync.Mutex
+	key     string
+	items   map[string]int64
+	now     time.Time
+	evalN   int
+	zrangeN int
+	zremN   int
+	timeN   int
 }
 
 func newMemZSet(key string, now time.Time) *memZSet {
@@ -25,6 +29,7 @@ func newMemZSet(key string, now time.Time) *memZSet {
 func (s *memZSet) Time(ctx context.Context) *redis.TimeCmd {
 	cmd := redis.NewTimeCmd(ctx, "time")
 	s.mu.Lock()
+	s.timeN++
 	cmd.SetVal(s.now)
 	s.mu.Unlock()
 	return cmd
@@ -75,6 +80,7 @@ func (s *memZSet) ZRem(ctx context.Context, key string, members ...interface{}) 
 	cmd := redis.NewIntCmd(ctx, "zrem")
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.zremN++
 	var n int64
 	if key == s.key {
 		for _, m := range members {
@@ -93,6 +99,7 @@ func (s *memZSet) ZRangeByScoreWithScores(ctx context.Context, key string, opt *
 	cmd := redis.NewZSliceCmd(ctx, "zrangebyscore")
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.zrangeN++
 	if key != s.key {
 		cmd.SetVal(nil)
 		return cmd
@@ -123,6 +130,76 @@ func (s *memZSet) ZRangeByScoreWithScores(ctx context.Context, key string, opt *
 	return cmd
 }
 
+func (s *memZSet) Eval(ctx context.Context, _ string, keys []string, args ...interface{}) *redis.Cmd {
+	cmd := redis.NewCmd(ctx, "eval")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.evalN++
+	if len(keys) != 1 || keys[0] != s.key {
+		cmd.SetVal([]any{})
+		return cmd
+	}
+	nowMilli := s.now.UnixMilli()
+	if len(args) > 0 {
+		switch x := args[0].(type) {
+		case string:
+			if x != "" {
+				if n, err := strconv.ParseInt(x, 10, 64); err == nil {
+					nowMilli = n
+				}
+			}
+		case int64:
+			nowMilli = x
+		case int:
+			nowMilli = int64(x)
+		}
+	}
+	n := 1
+	if len(args) > 1 {
+		switch x := args[1].(type) {
+		case int:
+			n = x
+		case int64:
+			n = int(x)
+		case string:
+			n, _ = strconv.Atoi(x)
+		}
+	}
+	if n < 1 {
+		n = 1
+	}
+	cmd.SetVal(s.claimDueLocked(nowMilli, n))
+	return cmd
+}
+
+func (s *memZSet) claimDueLocked(nowMilli int64, n int) []any {
+	type pair struct {
+		member string
+		score  int64
+	}
+	var due []pair
+	for member, score := range s.items {
+		if score <= nowMilli {
+			due = append(due, pair{member, score})
+		}
+	}
+	sort.Slice(due, func(i, j int) bool {
+		if due[i].score == due[j].score {
+			return due[i].member < due[j].member
+		}
+		return due[i].score < due[j].score
+	})
+	if n > 0 && len(due) > n {
+		due = due[:n]
+	}
+	out := make([]any, 0, len(due)*2)
+	for _, p := range due {
+		delete(s.items, p.member)
+		out = append(out, p.member, p.score)
+	}
+	return out
+}
+
 func testRedis(now time.Time) (*Redis, *memZSet) {
 	z := newMemZSet("jobs", now)
 	r := newRedis(z, "jobs", WithRedisClock(func() time.Time { return now }))
@@ -130,21 +207,13 @@ func testRedis(now time.Time) (*Redis, *memZSet) {
 }
 
 func TestRedisNewPanics(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected panic")
-		}
-	}()
-	newRedis(nil, "jobs")
+	expectPanicIs(t, ErrNilRedis, func() { newRedis(nil, "jobs") })
 }
 
 func TestRedisEmptyKeyPanics(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected panic")
-		}
-	}()
-	newRedis(newMemZSet("jobs", time.Now()), "")
+	expectPanicIs(t, ErrEmptyRedisKey, func() {
+		newRedis(newMemZSet("jobs", time.Now()), "")
+	})
 }
 
 func TestRedisScheduleCancelClaim(t *testing.T) {
@@ -314,5 +383,61 @@ func TestRedisClaimRestoresKindContainingColon(t *testing.T) {
 	}
 	if got[0].Kind != kind || got[0].Payload != payload || got[0].Key != task.Key {
 		t.Fatalf("got=%+v", got[0])
+	}
+}
+
+func TestRedisClaimUsesSingleEval(t *testing.T) {
+	now := time.UnixMilli(1_700_000_000_000)
+	r, z := testRedis(now)
+	ctx := context.Background()
+	for _, p := range []string{"a", "b", "c"} {
+		if err := r.Schedule(ctx, Task{Key: encodeTaskKey("order", p), Kind: "order", Payload: p, At: now.Add(-time.Second)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	z.mu.Lock()
+	z.evalN, z.zrangeN, z.zremN, z.timeN = 0, 0, 0, 0
+	z.mu.Unlock()
+	got, err := r.Claim(ctx, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got=%d", len(got))
+	}
+	z.mu.Lock()
+	evalN, zrangeN, zremN := z.evalN, z.zrangeN, z.zremN
+	z.mu.Unlock()
+	if evalN != 1 {
+		t.Fatalf("eval=%d want 1", evalN)
+	}
+	if zrangeN != 0 || zremN != 0 {
+		t.Fatalf("claim should be one EVAL, zrange=%d zrem=%d", zrangeN, zremN)
+	}
+}
+
+func TestRedisClaimEvalUsesServerTime(t *testing.T) {
+	now := time.UnixMilli(1_700_000_000_000)
+	z := newMemZSet("jobs", now)
+	r := newRedis(z, "jobs")
+	ctx := context.Background()
+	if err := r.Schedule(ctx, Task{Key: encodeTaskKey("order", "p1"), Kind: "order", Payload: "p1", At: now.Add(-time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	z.mu.Lock()
+	z.evalN, z.timeN, z.zrangeN, z.zremN = 0, 0, 0, 0
+	z.mu.Unlock()
+	got, err := r.Claim(ctx, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got=%v err=%v", got, err)
+	}
+	z.mu.Lock()
+	evalN, timeN := z.evalN, z.timeN
+	z.mu.Unlock()
+	if evalN != 1 {
+		t.Fatalf("eval=%d", evalN)
+	}
+	if timeN != 0 {
+		t.Fatalf("TIME should run inside EVAL, timeN=%d", timeN)
 	}
 }

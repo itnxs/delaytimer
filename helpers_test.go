@@ -29,13 +29,15 @@ type emptyEventParams struct{}
 func (p *emptyEventParams) Event() Event { return "" }
 
 type fakeStore struct {
-	mu        sync.Mutex
-	scheduled []Task
-	canceled  []string
-	claims    []Task
-	ackN      int
-	failN     int
-	claimErr  error
+	mu         sync.Mutex
+	scheduled  []Task
+	canceled   []string
+	claims     []Task
+	ackN       int
+	failN      int
+	claimErr   error
+	ackErr     error
+	claimCalls int
 }
 
 func (s *fakeStore) Schedule(_ context.Context, task Task) error {
@@ -55,6 +57,7 @@ func (s *fakeStore) Cancel(_ context.Context, key string) error {
 func (s *fakeStore) Claim(_ context.Context, n int) ([]Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.claimCalls++
 	if s.claimErr != nil {
 		return nil, s.claimErr
 	}
@@ -76,7 +79,7 @@ func (s *fakeStore) Ack(context.Context, Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ackN++
-	return nil
+	return s.ackErr
 }
 
 func (s *fakeStore) Fail(context.Context, Task) error {
@@ -92,6 +95,12 @@ func (s *fakeStore) snapshot() (scheduled []Task, canceled []string, ackN, failN
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]Task(nil), s.scheduled...), append([]string(nil), s.canceled...), s.ackN, s.failN
+}
+
+func (s *fakeStore) claimCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.claimCalls
 }
 
 func silentLogger() logrus.FieldLogger {
