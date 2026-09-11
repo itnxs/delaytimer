@@ -11,10 +11,10 @@ var (
     ErrPublishFailed = errors.New("publish failed")
     // ErrCancelUnsupported 当前后端不支持取消
     ErrCancelUnsupported = errors.New("cancel unsupported")
-    // ErrEmptyEvent EventName 为空
+    // ErrEmptyEvent Event 为空
     ErrEmptyEvent = errors.New("event is empty")
-    // ErrDuplicateEventName 同一 EventName 重复注册 Handler
-    ErrDuplicateEventName = errors.New("event name already registered")
+    // ErrDuplicateEvent 同一 Event重复注册 Handler
+    ErrDuplicateEvent = errors.New("event name already registered")
     // ErrNilTaskStore 未提供任务存储
     ErrNilTaskStore = errors.New("task store is nil")
     // ErrNilParam SetEvent / DelEvent 参数为空
@@ -22,5 +22,5 @@ var (
     // ErrNotPointerParams Bind / NewParams 必须返回指针，才能 JSON 解码
     ErrNotPointerParams = errors.New("params must be a pointer")
     // ErrUnmarshalParams 解码事件参数错误
-    ErrUnmarshalParams = errors.New("unmarshal event params failed")
+    ErrUnmarshalParams = errors.New("unmarshal params failed")
 )
