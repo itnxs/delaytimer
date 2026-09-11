@@ -61,10 +61,10 @@ func TestEventChannelCloseDoesNotWaitForPublish(t *testing.T) {
 }
 
 func TestSubscribeNilSafe(t *testing.T) {
-	Subscribe(nil, nil)
+	subscribe(nil, nil)
 	timer := New(&fakeStore{}, WithLogger(silentLogger()))
 	t.Cleanup(timer.Close)
-	Subscribe(timer, nil)
+	subscribe(timer, nil)
 }
 
 func TestSubscribeSetAndDel(t *testing.T) {

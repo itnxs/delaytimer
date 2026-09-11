@@ -222,7 +222,8 @@ func (t *Timer) Run(ctx context.Context) error {
     }
 }
 
-// dispatch 任务分发处理
+// dispatch 任务分发处理。先 Ack 再处理，避免 AMQP unack 堵住消费。
+// 未知 Kind、解码失败直接抛弃并打日志；Handle 失败暂只记日志，重入队/抛弃后续统一。
 func (t *Timer) dispatch(ctx context.Context, task Task) (err error) {
     defer func() {
         if rev := recover(); rev != nil {
@@ -234,18 +235,22 @@ func (t *Timer) dispatch(ctx context.Context, task Task) (err error) {
         }
     }()
 
+    if err := t.store.Ack(ctx, task); err != nil {
+        return errors.New("task ack failed")
+    }
+
     h, ok := t.handlers[Event(task.Kind)]
     if !ok {
-        return errors.Wrapf(ErrEmptyEvent, "kind: %s", task.Kind)
+        return errors.New("unknown kind, discarded")
     }
 
     inst := h.NewParams()
     if !isPointerParams(inst) {
-        return errors.WithStack(ErrNotPointerParams)
+        return errors.New("params is not a pointer, discarded")
     }
 
     if err := decodeParams(task.Payload, inst); err != nil {
-        return errors.WithStack(ErrUnmarshalParams)
+        return errors.New("unmarshal params failed, discarded")
     }
 
     t.logger.WithFields(logrus.Fields{
@@ -256,13 +261,6 @@ func (t *Timer) dispatch(ctx context.Context, task Task) (err error) {
 
     if err := h.Handle(ctx, inst); err != nil {
         return err
-    }
-
-    if err := t.store.Ack(ctx, task); err != nil {
-        t.logger.WithError(err).WithFields(logrus.Fields{
-            "kind": task.Kind,
-            "key":  task.Key,
-        }).Error("task ack failed")
     }
 
     return nil

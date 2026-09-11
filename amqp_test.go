@@ -40,17 +40,22 @@ func (c *fakeAMQPChannel) Consume(queue string, _ string, _, _, _, _ bool, _ amq
 }
 
 type fakeAcknowledger struct {
+	mu      sync.Mutex
 	acked   bool
 	nacked  bool
 	requeue bool
 }
 
 func (a *fakeAcknowledger) Ack(uint64, bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.acked = true
 	return nil
 }
 
 func (a *fakeAcknowledger) Nack(_ uint64, _ bool, requeue bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.nacked = true
 	a.requeue = requeue
 	return nil
@@ -143,6 +148,17 @@ func TestAMQPClaimConsumesConfiguredQueue(t *testing.T) {
 	if len(tasks) != 1 || tasks[0].Key != "order:1" || tasks[0].Kind != "order" {
 		t.Fatalf("tasks=%+v", tasks)
 	}
+	if tasks[0].ack != nil {
+		t.Fatal("claimed task should already be acked")
+	}
+	ack.mu.Lock()
+	defer ack.mu.Unlock()
+	if !ack.acked {
+		t.Fatal("claim should ack immediately")
+	}
+	if ack.nacked {
+		t.Fatal("claim should not nack")
+	}
 }
 
 func TestAMQPClaimQueueFallsBackToRoutingKey(t *testing.T) {
@@ -162,8 +178,10 @@ func TestAMQPClaimSkipsInvalidPayload(t *testing.T) {
 	ack := &fakeAcknowledger{}
 	deliveries := make(chan amqp.Delivery, 2)
 	deliveries <- amqp.Delivery{Acknowledger: ack, Body: []byte(`not-json`)}
+	okAck := &fakeAcknowledger{}
 	deliveries <- amqp.Delivery{
-		Body: []byte(`{"key":"ok","kind":"order","payload":"{}","at":1}`),
+		Acknowledger: okAck,
+		Body:         []byte(`{"key":"ok","kind":"order","payload":"{}","at":1}`),
 	}
 	ch := &fakeAMQPChannel{deliveries: deliveries}
 	a := NewAMQP(ch, testAMQPConfig())
@@ -180,6 +198,11 @@ func TestAMQPClaimSkipsInvalidPayload(t *testing.T) {
 	if len(tasks) != 1 || tasks[0].Key != "ok" {
 		t.Fatalf("tasks=%+v", tasks)
 	}
+	okAck.mu.Lock()
+	defer okAck.mu.Unlock()
+	if !okAck.acked {
+		t.Fatal("valid payload should be acked on claim")
+	}
 }
 
 func TestAMQPClaimClosedChannel(t *testing.T) {
@@ -194,7 +217,11 @@ func TestAMQPClaimClosedChannel(t *testing.T) {
 
 func TestAMQPClaimClosedAfterPartial(t *testing.T) {
 	deliveries := make(chan amqp.Delivery, 1)
-	deliveries <- amqp.Delivery{Body: []byte(`{"key":"ok","kind":"order","payload":"{}","at":1}`)}
+	okAck := &fakeAcknowledger{}
+	deliveries <- amqp.Delivery{
+		Acknowledger: okAck,
+		Body:         []byte(`{"key":"ok","kind":"order","payload":"{}","at":1}`),
+	}
 	close(deliveries)
 	a := NewAMQP(&fakeAMQPChannel{deliveries: deliveries}, testAMQPConfig())
 	tasks, err := a.Claim(context.Background(), 2)

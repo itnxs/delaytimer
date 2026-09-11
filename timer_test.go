@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 func TestNewNilStore(t *testing.T) {
@@ -96,8 +97,8 @@ func TestTimerRunHandleErrorDoesNotFail(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 	_, _, ackN, failN := store.snapshot()
-	if ackN != 0 || failN != 0 {
-		t.Fatalf("current dispatch does not Fail/Ack on handler error: ack=%d fail=%d", ackN, failN)
+	if ackN != 1 || failN != 0 {
+		t.Fatalf("claim acks immediately, handle error does not Fail: ack=%d fail=%d", ackN, failN)
 	}
 }
 
@@ -114,14 +115,66 @@ func TestTimerRunUnknownKind(t *testing.T) {
 		return len(store.claims) == 0
 	})
 	_, _, ackN, failN := store.snapshot()
-	if ackN != 0 || failN != 0 {
-		t.Fatalf("ack=%d fail=%d", ackN, failN)
+	if ackN != 1 || failN != 0 {
+		t.Fatalf("unknown kind should ack and discard: ack=%d fail=%d", ackN, failN)
 	}
 	cancel()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return")
+	}
+}
+
+func TestTimerRunBadPayloadDiscarded(t *testing.T) {
+	handled := make(chan struct{}, 1)
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
+		handled <- struct{}{}
+		return nil
+	})
+	store := &fakeStore{claims: []Task{{Key: "sample:x", Kind: "sample", Payload: "not-json", At: time.Unix(1, 0)}}}
+	timer := New(store, WithHandlers(h), WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
+	t.Cleanup(timer.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = timer.Run(ctx) }()
+	waitUntil(t, time.Second, func() bool {
+		_, _, ackN, _ := store.snapshot()
+		return ackN == 1
+	})
+	select {
+	case <-handled:
+		t.Fatal("handler should not run on bad payload")
+	case <-time.After(50 * time.Millisecond):
+	}
+	_, _, _, failN := store.snapshot()
+	if failN != 0 {
+		t.Fatalf("fail=%d", failN)
+	}
+}
+
+func TestTimerAMQPAckOnUnknownKind(t *testing.T) {
+	ack := &fakeAcknowledger{}
+	deliveries := make(chan amqp.Delivery, 1)
+	deliveries <- amqp.Delivery{
+		Acknowledger: ack,
+		Body:         []byte(`{"key":"x","kind":"missing","payload":"{}","at":1}`),
+	}
+	store := NewAMQP(&fakeAMQPChannel{deliveries: deliveries}, testAMQPConfig())
+	timer := New(store, WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
+	t.Cleanup(timer.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = timer.Run(ctx) }()
+	waitUntil(t, 2*time.Second, func() bool {
+		ack.mu.Lock()
+		defer ack.mu.Unlock()
+		return ack.acked
+	})
+	ack.mu.Lock()
+	defer ack.mu.Unlock()
+	if ack.nacked {
+		t.Fatal("unknown kind should ack, not nack")
 	}
 }
 
