@@ -1,96 +1,103 @@
 package delaytimer
 
 import (
-	"context"
-	"reflect"
+    "context"
+    "reflect"
 
-	jsoniter "github.com/json-iterator/go"
-	"github.com/pkg/errors"
+    jsoniter "github.com/json-iterator/go"
+    "github.com/pkg/errors"
 )
 
-var jsonAPI = jsoniter.ConfigCompatibleWithStandardLibrary // 字段顺序与结构体声明一致，保证 Cancel 身份稳定
+// jsonAPI 字段顺序与结构体声明一致，保证 Cancel 身份稳定
+var jsonAPI = jsoniter.ConfigCompatibleWithStandardLibrary
 
-// EventName 事件名，与 JSON 载荷一起构成 Cancel 身份。
-type EventName string
+// Event 事件名，与 JSON 载荷一起构成 Cancel 身份。
+type Event string
 
-// EventParams 投递载荷。domain 只实现本接口，不含处理逻辑。
-type EventParams interface {
-	EventName() EventName
+// String 转string
+func (e Event) String() string {
+    return string(e)
 }
 
-// EventHandler 到期处理。消费进程通过 WithHandlers 注册。
+// IsNil 是否为空
+func (e Event) IsNil() bool {
+    return e.String() == ""
+}
+
+// Params 投递载荷。domain 只实现本接口，不含处理逻辑。
+type Params interface {
+    Event() Event // Event名称
+}
+
+// EventHandler 到期消费处理
 type EventHandler interface {
-	EventName() EventName
-	NewParams() EventParams // 返回可 JSON 解码的指针副本
-	Handle(ctx context.Context, p EventParams) error
+    Event() Event      // Event名称
+    NewParams() Params // 解码指针参数
+    Handle(ctx context.Context, p Params) error
 }
 
-type boundHandler[P EventParams] struct {
-	proto P
-	fn    func(context.Context, P) error
+type boundHandler[P Params] struct {
+    proto   P
+    handler func(context.Context, P) error
 }
 
 // Bind 把参数原型和处理函数绑成 Handler。proto 必须是指针，供克隆后 JSON 解码。
-func Bind[P EventParams](proto P, fn func(context.Context, P) error) EventHandler {
-	if fn == nil {
-		panic("delaytimer: handler func is nil")
-	}
-	if !isPointerParams(proto) {
-		panic(errors.WithMessagef(ErrNotPointerParams, "%T", proto))
-	}
-	if proto.EventName() == "" {
-		panic(ErrEmptyEventName)
-	}
-	return &boundHandler[P]{proto: proto, fn: fn}
+func Bind[P Params](proto P, handler func(context.Context, P) error) EventHandler {
+    if handler == nil {
+        panic(errors.Wrapf(ErrNilEventHandler, "%T", handler))
+    }
+    if !isPointerParams(proto) {
+        panic(errors.Wrapf(ErrNotPointerParams, "%T", proto))
+    }
+    if proto.Event().IsNil() {
+        panic(errors.WithStack(ErrEmptyEvent))
+    }
+    return &boundHandler[P]{proto: proto, handler: handler}
 }
 
-func (h *boundHandler[P]) EventName() EventName {
-	return h.proto.EventName()
+// Event 事件名称
+func (h *boundHandler[P]) Event() Event {
+    return h.proto.Event()
 }
 
-func (h *boundHandler[P]) NewParams() EventParams {
-	p, err := cloneParams(h.proto)
-	if err != nil {
-		panic(err)
-	}
-	return p
+// NewParams 复制参数
+func (h *boundHandler[P]) NewParams() Params {
+    v := reflect.ValueOf(h.proto)
+    if v.Kind() != reflect.Ptr || v.IsNil() {
+        return nil
+    }
+    p, ok := reflect.New(v.Type().Elem()).Interface().(Params)
+    if !ok {
+        return nil
+    }
+    return p
 }
 
-func (h *boundHandler[P]) Handle(ctx context.Context, p EventParams) error {
-	typed, ok := p.(P)
-	if !ok {
-		return errors.Errorf("delaytimer: params type mismatch want %T got %T", h.proto, p)
-	}
-	return h.fn(ctx, typed)
+// Handle 处理程序
+func (h *boundHandler[P]) Handle(ctx context.Context, p Params) error {
+    t, ok := p.(P)
+    if !ok {
+        return errors.Errorf("params type mismatch want %T got %T", h.proto, p)
+    }
+    return h.handler(ctx, t)
 }
 
-func cloneParams(proto EventParams) (EventParams, error) {
-	rv := reflect.ValueOf(proto)
-	if rv.Kind() != reflect.Ptr || rv.IsNil() {
-		return nil, errors.WithMessagef(ErrNotPointerParams, "%T", proto)
-	}
-	cloned, ok := reflect.New(rv.Type().Elem()).Interface().(EventParams)
-	if !ok {
-		return nil, errors.WithMessagef(ErrNotPointerParams, "%T", proto)
-	}
-	return cloned, nil
+// isPointerParams 是否是指针参数
+func isPointerParams(p Params) bool {
+    rv := reflect.ValueOf(p)
+    return rv.Kind() == reflect.Ptr && !rv.IsNil()
 }
 
-func isPointerParams(p EventParams) bool {
-	rv := reflect.ValueOf(p)
-	return rv.Kind() == reflect.Ptr && !rv.IsNil()
+// encodeParams 序列化投递参数
+func encodeParams(p Params) (string, error) {
+    s, err := jsonAPI.MarshalToString(p)
+    if err != nil {
+        return "", errors.WithStack(err)
+    }
+    return s, nil
 }
 
-// encodeParams 序列化投递载荷。
-func encodeParams(p EventParams) (string, error) {
-	s, err := jsonAPI.MarshalToString(p)
-	if err != nil {
-		return "", errors.WithStack(err)
-	}
-	return s, nil
-}
-
-// decodeParams 解码到已克隆的指针原型。
-func decodeParams(payload string, p EventParams) error {
-	return errors.WithStack(jsonAPI.UnmarshalFromString(payload, p))
+// decodeParams 解码到已克隆的指针参数
+func decodeParams(payload string, p Params) error {
+    return errors.WithStack(jsonAPI.UnmarshalFromString(payload, p))
 }

@@ -2,7 +2,6 @@ package delaytimer
 
 import (
     "context"
-    "fmt"
     "time"
 )
 
@@ -41,15 +40,3 @@ type (
         Nack(requeue bool) error
     }
 )
-
-func (j Task) withKey() Task {
-    if j.Key == "" {
-        j.Key = createTaskKey(j.Kind, j.Payload)
-    }
-    return j
-}
-
-// createTaskKey 事件名与JSON载荷组成Cancel身份，同名同参数才能删掉
-func createTaskKey(kind, payload string) string {
-    return fmt.Sprintf("%s:%s", kind, payload)
-}
