@@ -151,20 +151,22 @@ func TestRedisScheduleCancelClaim(t *testing.T) {
 	now := time.UnixMilli(1_700_000_000_000)
 	r, z := testRedis(now)
 	ctx := context.Background()
-	due := Task{Key: "order:p1", Kind: "order", Payload: "p1", At: now.Add(-time.Second)}
-	later := Task{Key: "order:p2", Kind: "order", Payload: "p2", At: now.Add(time.Hour)}
+	k1 := encodeTaskKey("order", "p1")
+	k2 := encodeTaskKey("order", "p2")
+	due := Task{Key: k1, Kind: "order", Payload: "p1", At: now.Add(-time.Second)}
+	later := Task{Key: k2, Kind: "order", Payload: "p2", At: now.Add(time.Hour)}
 	if err := r.Schedule(ctx, due); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Schedule(ctx, later); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Schedule(ctx, Task{Key: "order:p1", Kind: "order", Payload: "p1", At: now.Add(-2 * time.Second)}); err != nil {
+	if err := r.Schedule(ctx, Task{Key: k1, Kind: "order", Payload: "p1", At: now.Add(-2 * time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	z.mu.Lock()
-	if z.items["order:p1"] != now.Add(-2*time.Second).UnixMilli() {
-		t.Fatalf("score not overwritten: %d", z.items["order:p1"])
+	if z.items[k1] != now.Add(-2*time.Second).UnixMilli() {
+		t.Fatalf("score not overwritten: %d", z.items[k1])
 	}
 	z.mu.Unlock()
 
@@ -172,18 +174,18 @@ func TestRedisScheduleCancelClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Key != "order:p1" || got[0].Kind != "order" || got[0].Payload != "p1" {
+	if len(got) != 1 || got[0].Key != k1 || got[0].Kind != "order" || got[0].Payload != "p1" {
 		t.Fatalf("got=%+v", got)
 	}
 	empty, err := r.Claim(ctx, 1)
 	if err != nil || len(empty) != 0 {
 		t.Fatalf("no due should return empty immediately: %v %v", empty, err)
 	}
-	if err := r.Cancel(ctx, "order:p2"); err != nil {
+	if err := r.Cancel(ctx, k2); err != nil {
 		t.Fatal(err)
 	}
 	z.mu.Lock()
-	_, ok := z.items["order:p2"]
+	_, ok := z.items[k2]
 	z.mu.Unlock()
 	if ok {
 		t.Fatal("cancel should remove member")
@@ -200,7 +202,7 @@ func TestRedisClaimCompetitive(t *testing.T) {
 	r1 := newRedis(z, "jobs", WithRedisClock(clock))
 	r2 := newRedis(z, "jobs", WithRedisClock(clock))
 	ctx := context.Background()
-	if err := r1.Schedule(ctx, Task{Key: "order:p1", Kind: "order", Payload: "p1", At: now.Add(-time.Second)}); err != nil {
+	if err := r1.Schedule(ctx, Task{Key: encodeTaskKey("order", "p1"), Kind: "order", Payload: "p1", At: now.Add(-time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	var n1, n2 int
@@ -232,7 +234,7 @@ func TestRedisFailAndRelease(t *testing.T) {
 	now := time.UnixMilli(1_700_000_000_000)
 	r, z := testRedis(now)
 	ctx := context.Background()
-	task := Task{Key: "order:p1", Kind: "order", Payload: "p1", At: now.Add(-time.Second)}
+	task := Task{Key: encodeTaskKey("order", "p1"), Kind: "order", Payload: "p1", At: now.Add(-time.Second)}
 	if err := r.Schedule(ctx, task); err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +246,7 @@ func TestRedisFailAndRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	z.mu.Lock()
-	failAt := z.items["order:p1"]
+	failAt := z.items[encodeTaskKey("order", "p1")]
 	z.mu.Unlock()
 	if failAt != now.UnixMilli()+failRequeueDelay.Milliseconds() {
 		t.Fatalf("fail score=%d", failAt)
@@ -254,7 +256,7 @@ func TestRedisFailAndRelease(t *testing.T) {
 		t.Fatalf("not due yet: %v %v", empty, err)
 	}
 
-	newer := Task{Key: "order:p1", Kind: "order", Payload: "p1", At: now.Add(time.Hour)}
+	newer := Task{Key: encodeTaskKey("order", "p1"), Kind: "order", Payload: "p1", At: now.Add(time.Hour)}
 	if err := r.Schedule(ctx, newer); err != nil {
 		t.Fatal(err)
 	}
@@ -262,8 +264,8 @@ func TestRedisFailAndRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	z.mu.Lock()
-	if z.items["order:p1"] != now.Add(time.Hour).UnixMilli() {
-		t.Fatalf("fail must not overwrite: %d", z.items["order:p1"])
+	if z.items[encodeTaskKey("order", "p1")] != now.Add(time.Hour).UnixMilli() {
+		t.Fatalf("fail must not overwrite: %d", z.items[encodeTaskKey("order", "p1")])
 	}
 	z.mu.Unlock()
 
@@ -271,7 +273,7 @@ func TestRedisFailAndRelease(t *testing.T) {
 	if err != nil || len(claimed) != 0 {
 		t.Fatalf("future task: %v %v", claimed, err)
 	}
-	if err := r.Cancel(ctx, "order:p1"); err != nil {
+	if err := r.Cancel(ctx, encodeTaskKey("order", "p1")); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Release(ctx, got[0]); err != nil {
@@ -287,11 +289,30 @@ func TestRedisClaimMinN(t *testing.T) {
 	now := time.UnixMilli(1_700_000_000_000)
 	r, _ := testRedis(now)
 	ctx := context.Background()
-	if err := r.Schedule(ctx, Task{Key: "order:p1", Kind: "order", Payload: "p1", At: now.Add(-time.Second)}); err != nil {
+	if err := r.Schedule(ctx, Task{Key: encodeTaskKey("order", "p1"), Kind: "order", Payload: "p1", At: now.Add(-time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := r.Claim(ctx, 0)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("n<1 got=%v err=%v", got, err)
+	}
+}
+
+func TestRedisClaimRestoresKindContainingColon(t *testing.T) {
+	now := time.UnixMilli(1_700_000_000_000)
+	r, _ := testRedis(now)
+	ctx := context.Background()
+	kind := "order:timeout"
+	payload := `{"id":"1","a":"b"}`
+	task := Task{Key: encodeTaskKey(kind, payload), Kind: kind, Payload: payload, At: now.Add(-time.Second)}
+	if err := r.Schedule(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.Claim(ctx, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("claim=%v err=%v", got, err)
+	}
+	if got[0].Kind != kind || got[0].Payload != payload || got[0].Key != task.Key {
+		t.Fatalf("got=%+v", got[0])
 	}
 }

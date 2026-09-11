@@ -27,7 +27,8 @@ type AMQPConfig struct {
 	Queue      string
 }
 
-// AMQP 延迟交换机 + 竞争消费。应用服务，对外实现 Store，对内委托拓扑与 broker。
+// AMQP 延迟交换机 + 竞争消费。Cancel 恒为 ErrCancelUnsupported。
+// Claim 成功解码后立刻 Ack，避免 unack 堵住消费。
 type AMQP struct {
 	clock    Clock
 	topology *amqpTopology
@@ -46,7 +47,8 @@ func WithAMQPClock(c Clock) AMQPOption {
 	}
 }
 
-// NewAMQP 新建 AMQP 后端。ch 一般为 *amqp.Channel。Cancel 恒为 ErrCancelUnsupported。
+// NewAMQP 新建 AMQP 后端。ch 一般为 *amqp.Channel。Cancel / DelEvent 恒为 ErrCancelUnsupported。
+// 交换机与队列需由调用方声明（x-delayed-message）。
 func NewAMQP(ch AMQPChannel, cfg AMQPConfig, options ...AMQPOption) *AMQP {
 	a := &AMQP{
 		clock:    time.Now,
@@ -72,7 +74,7 @@ func (a *AMQP) Schedule(ctx context.Context, task Task) error {
 	return a.broker.publish(ctx, a.topology.route(), msg)
 }
 
-// Cancel AMQP 延迟消息无法从 broker 撤回
+// Cancel AMQP 延迟消息无法从 broker 撤回，恒返回 ErrCancelUnsupported。
 func (a *AMQP) Cancel(context.Context, string) error {
 	return ErrCancelUnsupported
 }
@@ -108,7 +110,6 @@ func (a *AMQP) Claim(ctx context.Context, n int) ([]Task, error) {
 			continue
 		}
 		// 领取后立刻 Ack，避免 Handle / 未知 Kind 失败占着 unack 堵住消费。
-		// Handle 失败后的重入队 / 抛弃后续统一处理。
 		if err := ackClaimed(&task); err != nil {
 			if len(out) == 0 {
 				return nil, err
@@ -120,17 +121,21 @@ func (a *AMQP) Claim(ctx context.Context, n int) ([]Task, error) {
 	return out, nil
 }
 
-// Ack 确认消息
+// Ack 确认消息。Claim 时通常已 Ack，此处为空操作。
 func (a *AMQP) Ack(_ context.Context, task Task) error {
 	return confirmAMQP(task, func(h ack) error { return h.Ack() })
 }
 
-// Fail 重新入队。Timer FailDiscard 走 Ack，不会调到这里。
-func (a *AMQP) Fail(_ context.Context, task Task) error {
-	return confirmAMQP(task, func(h ack) error { return h.Nack(true) })
+// Fail 重新入队。领取时已 Ack 则重新发布；若仍持有投递则 Nack。
+func (a *AMQP) Fail(ctx context.Context, task Task) error {
+	if task.ack != nil {
+		return confirmAMQP(task, func(h ack) error { return h.Nack(true) })
+	}
+	task.At = a.clock().Add(failRequeueDelay)
+	return a.Schedule(ctx, task)
 }
 
-// Release 把未完成消息重新入队，供其他副本领取（K8s 滚动重启）。
+// Release 把未 Ack 消息重新入队。Claim 后已 Ack，调用为空操作。
 func (a *AMQP) Release(_ context.Context, task Task) error {
 	return confirmAMQP(task, func(h ack) error { return h.Nack(true) })
 }

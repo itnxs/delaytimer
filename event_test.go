@@ -94,3 +94,15 @@ func TestEventHelpers(t *testing.T) {
 		t.Fatal("event string")
 	}
 }
+
+func TestEncodeDecodeTaskKey(t *testing.T) {
+	kind, payload := "order:timeout|v2", `{"a":"b|c","n":1}`
+	key := encodeTaskKey(kind, payload)
+	if key != kind+taskKeySep+payload {
+		t.Fatalf("key=%q", key)
+	}
+	k, p := decodeTaskKey(key)
+	if k != kind || p != payload {
+		t.Fatalf("kind=%q payload=%q", k, p)
+	}
+}

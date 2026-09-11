@@ -266,3 +266,42 @@ func TestAMQPAckFailRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestAMQPFailRepublishesAfterClaimAck(t *testing.T) {
+	ack := &fakeAcknowledger{}
+	deliveries := make(chan amqp.Delivery, 1)
+	deliveries <- amqp.Delivery{
+		Acknowledger: ack,
+		Body:         []byte(`{"key":"order:1","kind":"order","payload":"{}","at":1}`),
+	}
+	ch := &fakeAMQPChannel{deliveries: deliveries}
+	now := time.UnixMilli(1_700_000_000_000)
+	a := NewAMQP(ch, testAMQPConfig(), WithAMQPClock(func() time.Time { return now }))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	tasks, err := a.Claim(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("tasks=%d", len(tasks))
+	}
+	ack.mu.Lock()
+	claimed := ack.acked
+	ack.mu.Unlock()
+	if !claimed {
+		t.Fatal("claim should ack")
+	}
+
+	if err := a.Fail(ctx, tasks[0]); err != nil {
+		t.Fatal(err)
+	}
+	if len(ch.pubs) != 1 {
+		t.Fatalf("fail should republish, pubs=%d", len(ch.pubs))
+	}
+	delay, _ := ch.pubs[0].msg.Headers["x-delay"].(int64)
+	if delay != failRequeueDelay.Milliseconds() {
+		t.Fatalf("x-delay=%v", ch.pubs[0].msg.Headers["x-delay"])
+	}
+}

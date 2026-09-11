@@ -12,10 +12,37 @@ const (
 	defaultInterval    = 200 * time.Millisecond
 )
 
+// FailPolicy Handler 返回错误后的处理。未知 Kind / 解码失败始终抛弃，不受此配置影响。
+type FailPolicy int
+
+const (
+	// FailDiscard 抛弃任务（默认）
+	FailDiscard FailPolicy = iota
+	// FailRequeue 约 200ms 后重新入队
+	FailRequeue
+)
+
 // Option 配置 Timer
 type Option func(*Timer)
 
-// WithHandlers 注册到期 Handler（消费进程）
+// WithFailPolicy 仅在 Handler 处理失败后生效：抛弃或重新入队。
+func WithFailPolicy(p FailPolicy) Option {
+	return func(t *Timer) {
+		t.failPolicy = p
+	}
+}
+
+// WithBus 启用可选 Rx 通道。Timer.SetEvent / DelEvent 只表示进入通道，
+// 真正写入 Store 在订阅回调里。默认不启用，此时 SetEvent / DelEvent 同步写 Store。
+func WithBus(bus Bus) Option {
+	return func(t *Timer) {
+		if bus != nil {
+			t.bus = bus
+		}
+	}
+}
+
+// WithHandlers 注册到期 Handler
 func WithHandlers(handlers ...EventHandler) Option {
 	return func(t *Timer) {
 		t.registers = append(t.registers, handlers...)
@@ -61,7 +88,7 @@ func WithBatchSize(size int) Option {
 	}
 }
 
-// WithPollInterval Claim 为空时的等待间隔
+// WithPollInterval Claim 无任务或失败后的等待间隔。Redis Claim 不阻塞，主要靠此项轮询。
 func WithPollInterval(duration time.Duration) Option {
 	return func(t *Timer) {
 		if duration > 0 {

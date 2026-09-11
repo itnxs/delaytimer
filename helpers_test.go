@@ -104,7 +104,7 @@ func sampleTaskAt(at time.Time) Task {
 		panic(err)
 	}
 	return Task{
-		Key:     "sample:" + payload,
+		Key:     encodeTaskKey("sample", payload),
 		Kind:    "sample",
 		Payload: payload,
 		At:      at,

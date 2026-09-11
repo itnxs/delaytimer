@@ -67,24 +67,78 @@ func TestSubscribeNilSafe(t *testing.T) {
 	subscribe(timer, nil)
 }
 
-func TestSubscribeSetAndDel(t *testing.T) {
+func TestBusWithoutSubscribeDoesNotWriteStore(t *testing.T) {
 	store := &fakeStore{}
+	bus := NewBus()
 	timer := New(store, WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	if err := bus.SetEvent(time.Now(), &sampleParams{ID: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	scheduled, _, _, _ := store.snapshot()
+	if len(scheduled) != 0 {
+		t.Fatalf("bus without WithBus must not write store, got %d", len(scheduled))
+	}
+}
+
+type routeBus struct {
+	setN int
+	delN int
+}
+
+func (b *routeBus) SetEvents() *EventChannel { return nil }
+func (b *routeBus) DelEvents() *EventChannel { return nil }
+func (b *routeBus) SetEvent(time.Time, Params) error {
+	b.setN++
+	return nil
+}
+func (b *routeBus) DelEvent(Params) error {
+	b.delN++
+	return nil
+}
+
+func TestTimerSetEventUsesBusWhenConfigured(t *testing.T) {
+	store := &fakeStore{}
+	bus := &routeBus{}
+	timer := New(store, WithBus(bus), WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	p := &sampleParams{ID: "1"}
+	if err := timer.SetEvent(time.Unix(1000, 0), p); err != nil {
+		t.Fatal(err)
+	}
+	if err := timer.DelEvent(p); err != nil {
+		t.Fatal(err)
+	}
+	if bus.setN != 1 || bus.delN != 1 {
+		t.Fatalf("set=%d del=%d", bus.setN, bus.delN)
+	}
+	scheduled, canceled, _, _ := store.snapshot()
+	if len(scheduled) != 0 || len(canceled) != 0 {
+		t.Fatalf("with bus, SetEvent/DelEvent must not write store directly: scheduled=%d canceled=%d", len(scheduled), len(canceled))
+	}
+}
+
+func TestWithBusSetEventWritesStoreEventually(t *testing.T) {
+	store := &fakeStore{}
+	bus := NewBus()
+	timer := New(store, WithBus(bus), WithLogger(silentLogger()))
 	t.Cleanup(timer.Close)
 	at := time.Unix(1000, 0)
 	p := &sampleParams{ID: "1"}
 	if err := timer.SetEvent(at, p); err != nil {
 		t.Fatal(err)
 	}
-	scheduled, _, _, _ := store.snapshot()
-	if len(scheduled) != 1 {
-		t.Fatalf("expected sync schedule, got %d", len(scheduled))
-	}
+	waitUntil(t, time.Second, func() bool {
+		scheduled, _, _, _ := store.snapshot()
+		return len(scheduled) == 1
+	})
 	payload, err := encodeParams(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantKey := "sample:" + payload
+	wantKey := encodeTaskKey("sample", payload)
+	scheduled, _, _, _ := store.snapshot()
 	if scheduled[0].Key != wantKey || scheduled[0].Kind != "sample" || scheduled[0].At != at {
 		t.Fatalf("task=%+v", scheduled[0])
 	}
@@ -92,8 +146,12 @@ func TestSubscribeSetAndDel(t *testing.T) {
 	if err := timer.DelEvent(p); err != nil {
 		t.Fatal(err)
 	}
+	waitUntil(t, time.Second, func() bool {
+		_, canceled, _, _ := store.snapshot()
+		return len(canceled) == 1
+	})
 	_, canceled, _, _ := store.snapshot()
-	if len(canceled) != 1 || canceled[0] != wantKey {
+	if canceled[0] != wantKey {
 		t.Fatalf("canceled=%v", canceled)
 	}
 }

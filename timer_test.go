@@ -52,9 +52,9 @@ func TestTimerRunAcksOnSuccess(t *testing.T) {
 	})
 	timer := New(store, WithHandlers(h), WithLogger(silentLogger()), WithPollInterval(time.Millisecond), WithConcurrency(1))
 	t.Cleanup(timer.Close)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- timer.Run(ctx) }()
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case <-handled:
@@ -65,15 +65,6 @@ func TestTimerRunAcksOnSuccess(t *testing.T) {
 		_, _, ackN, failN := store.snapshot()
 		return ackN == 1 && failN == 0
 	})
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("run=%v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Run did not return")
-	}
 }
 
 func TestTimerRunHandleErrorDoesNotFail(t *testing.T) {
@@ -86,9 +77,9 @@ func TestTimerRunHandleErrorDoesNotFail(t *testing.T) {
 	})
 	timer := New(store, WithHandlers(h), WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
 	t.Cleanup(timer.Close)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = timer.Run(ctx) }()
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case <-handled:
@@ -98,7 +89,61 @@ func TestTimerRunHandleErrorDoesNotFail(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	_, _, ackN, failN := store.snapshot()
 	if ackN != 1 || failN != 0 {
-		t.Fatalf("claim acks immediately, handle error does not Fail: ack=%d fail=%d", ackN, failN)
+		t.Fatalf("default FailDiscard: ack=%d fail=%d", ackN, failN)
+	}
+}
+
+func TestTimerRunHandleErrorRequeue(t *testing.T) {
+	task := sampleTaskAt(time.Unix(1, 0))
+	store := &fakeStore{claims: []Task{task}}
+	handled := make(chan struct{}, 1)
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
+		handled <- struct{}{}
+		return errors.New("boom")
+	})
+	timer := New(store, WithHandlers(h), WithFailPolicy(FailRequeue), WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
+	t.Cleanup(timer.Close)
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-handled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler not called")
+	}
+	waitUntil(t, time.Second, func() bool {
+		_, _, _, failN := store.snapshot()
+		return failN == 1
+	})
+	_, _, ackN, failN := store.snapshot()
+	if ackN != 1 || failN != 1 {
+		t.Fatalf("handle error should ack then Fail: ack=%d fail=%d", ackN, failN)
+	}
+}
+
+func TestTimerFailRequeueSkipsUnknownKindAndBadPayload(t *testing.T) {
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
+		t.Fatal("handler should not run")
+		return nil
+	})
+	store := &fakeStore{claims: []Task{
+		{Key: "x", Kind: "missing", Payload: "{}", At: time.Unix(1, 0)},
+		{Key: encodeTaskKey("sample", "x"), Kind: "sample", Payload: "not-json", At: time.Unix(2, 0)},
+	}}
+	timer := New(store, WithHandlers(h), WithFailPolicy(FailRequeue), WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
+	t.Cleanup(timer.Close)
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, time.Second, func() bool {
+		_, _, ackN, _ := store.snapshot()
+		return ackN == 2
+	})
+	time.Sleep(50 * time.Millisecond)
+	_, _, _, failN := store.snapshot()
+	if failN != 0 {
+		t.Fatalf("unknown kind / decode fail must not Fail: fail=%d", failN)
 	}
 }
 
@@ -106,9 +151,9 @@ func TestTimerRunUnknownKind(t *testing.T) {
 	store := &fakeStore{claims: []Task{{Key: "x", Kind: "missing", Payload: "{}", At: time.Unix(1, 0)}}}
 	timer := New(store, WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
 	t.Cleanup(timer.Close)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- timer.Run(ctx) }()
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	waitUntil(t, time.Second, func() bool {
 		store.mu.Lock()
 		defer store.mu.Unlock()
@@ -118,12 +163,6 @@ func TestTimerRunUnknownKind(t *testing.T) {
 	if ackN != 1 || failN != 0 {
 		t.Fatalf("unknown kind should ack and discard: ack=%d fail=%d", ackN, failN)
 	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Run did not return")
-	}
 }
 
 func TestTimerRunBadPayloadDiscarded(t *testing.T) {
@@ -132,12 +171,12 @@ func TestTimerRunBadPayloadDiscarded(t *testing.T) {
 		handled <- struct{}{}
 		return nil
 	})
-	store := &fakeStore{claims: []Task{{Key: "sample:x", Kind: "sample", Payload: "not-json", At: time.Unix(1, 0)}}}
+	store := &fakeStore{claims: []Task{{Key: encodeTaskKey("sample", "x"), Kind: "sample", Payload: "not-json", At: time.Unix(1, 0)}}}
 	timer := New(store, WithHandlers(h), WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
 	t.Cleanup(timer.Close)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = timer.Run(ctx) }()
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	waitUntil(t, time.Second, func() bool {
 		_, _, ackN, _ := store.snapshot()
 		return ackN == 1
@@ -163,9 +202,9 @@ func TestTimerAMQPAckOnUnknownKind(t *testing.T) {
 	store := NewAMQP(&fakeAMQPChannel{deliveries: deliveries}, testAMQPConfig())
 	timer := New(store, WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
 	t.Cleanup(timer.Close)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = timer.Run(ctx) }()
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	waitUntil(t, 2*time.Second, func() bool {
 		ack.mu.Lock()
 		defer ack.mu.Unlock()
@@ -186,10 +225,9 @@ func TestTimerSetEventAndDelEvent(t *testing.T) {
 	})
 	timer := New(NewMemory(), WithHandlers(h), WithLogger(silentLogger()), WithPollInterval(10*time.Millisecond))
 	t.Cleanup(timer.Close)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = timer.Run(ctx) }()
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := timer.SetEvent(time.Now().Add(-time.Second), &sampleParams{ID: "ok"}); err != nil {
 		t.Fatal(err)
@@ -245,7 +283,7 @@ func TestTimerSetEventWritesStoreImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantKey := "sample:" + payload
+	wantKey := encodeTaskKey("sample", payload)
 	if scheduled[0].Key != wantKey || scheduled[0].At != at {
 		t.Fatalf("task=%+v", scheduled[0])
 	}
@@ -258,19 +296,67 @@ func TestTimerSetEventWritesStoreImmediately(t *testing.T) {
 	}
 }
 
-func TestTimerCloseStopsRun(t *testing.T) {
+func TestTimerCloseStopsStart(t *testing.T) {
 	timer := New(NewMemory(), WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
-	done := make(chan error, 1)
-	go func() { done <- timer.Run(context.Background()) }()
-	time.Sleep(30 * time.Millisecond)
-	timer.Close()
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		timer.Close()
+		close(done)
+	}()
 	select {
-	case err := <-done:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Fatalf("run=%v", err)
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close should stop Start and return")
+	}
+}
+
+func TestTimerStartCloseWaits(t *testing.T) {
+	timer := New(NewMemory(), WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := timer.Start(context.Background()); !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("second start=%v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		timer.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close should cancel and wait")
+	}
+	if err := timer.Start(context.Background()); !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("start after close=%v", err)
+	}
+}
+
+func TestTimerStartHandlesEvent(t *testing.T) {
+	handled := make(chan *sampleParams, 1)
+	h := Bind(&sampleParams{}, func(_ context.Context, p *sampleParams) error {
+		handled <- p
+		return nil
+	})
+	timer := New(NewMemory(), WithHandlers(h), WithLogger(silentLogger()), WithPollInterval(10*time.Millisecond))
+	defer timer.Close()
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := timer.SetEvent(time.Now().Add(-time.Second), &sampleParams{ID: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p := <-handled:
+		if p.ID != "ok" {
+			t.Fatalf("id=%s", p.ID)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Close should stop Run")
+		t.Fatal("due event was not handled")
 	}
 }
 
@@ -306,15 +392,15 @@ func TestTimerRunConcurrentDispatch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		claims[i] = Task{Key: "sample:" + payload, Kind: "sample", Payload: payload, At: now}
+		claims[i] = Task{Key: encodeTaskKey("sample", payload), Kind: "sample", Payload: payload, At: now}
 	}
 	store := &fakeStore{claims: claims}
 	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error { return nil })
 	timer := New(store, WithHandlers(h), WithLogger(silentLogger()), WithPollInterval(time.Millisecond), WithConcurrency(8), WithBatchSize(8))
 	t.Cleanup(timer.Close)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = timer.Run(ctx) }()
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	waitUntil(t, 2*time.Second, func() bool {
 		_, _, ackN, _ := store.snapshot()
 		return ackN == 8

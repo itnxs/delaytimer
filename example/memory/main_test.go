@@ -12,7 +12,6 @@ import (
 
 func TestMemoryEventTimer(t *testing.T) {
 	handled := make(chan *OrderTimeout, 4)
-	ctx, cancel := context.WithCancel(context.Background())
 	timer := delaytimer.New(delaytimer.NewMemory(),
 		delaytimer.WithHandlers(delaytimer.Bind(&OrderTimeout{}, func(_ context.Context, p *OrderTimeout) error {
 			handled <- p
@@ -21,11 +20,10 @@ func TestMemoryEventTimer(t *testing.T) {
 		delaytimer.WithLogger(silentLogger()),
 		delaytimer.WithPollInterval(10*time.Millisecond),
 	)
-	defer func() {
-		cancel()
-		timer.Close()
-	}()
-	go func() { _ = timer.Run(ctx) }()
+	defer timer.Close()
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := timer.SetEvent(time.Now().Add(-time.Second), &OrderTimeout{OrderID: "ok"}); err != nil {
 		t.Fatal(err)
