@@ -169,12 +169,14 @@ func (t *Timer) bindHandlers() {
 // Run 启动服务处理。ctx 取消或 Close 后返回。
 func (t *Timer) Run(ctx context.Context) error {
     ctx, cancel := context.WithCancel(ctx)
+
     t.mu.Lock()
     if t.closed {
         t.mu.Unlock()
         cancel()
         return context.Canceled
     }
+
     t.cancel = cancel
     t.mu.Unlock()
     defer t.Close()
