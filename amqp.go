@@ -17,9 +17,12 @@ var _ AMQPChannel = (*amqp.Channel)(nil)
 type AMQPChannel interface {
 	PublishWithContext(ctx context.Context, exchange, key string, mandatory, immediate bool, msg amqp.Publishing) error
 	Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error)
+	ExchangeDeclare(name, kind string, durable, autoDelete, internal, noWait bool, args amqp.Table) error
+	QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (amqp.Queue, error)
+	QueueBind(name, key, exchange string, noWait bool, args amqp.Table) error
 }
 
-// AMQPConfig AMQP 后端配置。交换机 / 队列由调用方声明（x-delayed-message）。
+// AMQPConfig AMQP 后端配置。首次 Schedule / Claim 时打开 Channel，并声明 x-delayed-message 交换机、队列并绑定。
 // 发布使用 Exchange + RoutingKey；消费 Queue，为空则回退到 RoutingKey。
 type AMQPConfig struct {
 	Exchange   string
@@ -47,13 +50,38 @@ func WithAMQPClock(c Clock) AMQPOption {
 	}
 }
 
-// NewAMQP 新建 AMQP 后端。ch 一般为 *amqp.Channel。Cancel / DelEvent 恒为 ErrCancelUnsupported。
-// 交换机与队列需由调用方声明（x-delayed-message）。
-func NewAMQP(ch AMQPChannel, cfg AMQPConfig, options ...AMQPOption) *AMQP {
+// amqpConn 能从连接打开 Channel。*amqp.Connection 经 NewAMQP 包装后满足。
+type amqpConn interface {
+	Channel() (AMQPChannel, error)
+}
+
+type amqpConnection struct {
+	conn *amqp.Connection
+}
+
+func (c *amqpConnection) Channel() (AMQPChannel, error) {
+	if c == nil || c.conn == nil {
+		return nil, ErrPublishFailed
+	}
+	return c.conn.Channel()
+}
+
+// NewAMQP 新建 AMQP 后端。conn 由调用方 Dial / Close；内部自行 Channel()。
+// Cancel / DelEvent 恒为 ErrCancelUnsupported。
+// 首次使用时声明 x-delayed-message 交换机（x-delayed-type=direct）、队列并绑定。
+func NewAMQP(conn *amqp.Connection, cfg AMQPConfig, options ...AMQPOption) *AMQP {
+	var opener amqpConn
+	if conn != nil {
+		opener = &amqpConnection{conn: conn}
+	}
+	return newAMQP(opener, cfg, options...)
+}
+
+func newAMQP(conn amqpConn, cfg AMQPConfig, options ...AMQPOption) *AMQP {
 	a := &AMQP{
 		clock:    time.Now,
 		topology: newAMQPTopology(cfg),
-		broker:   newAMQPBroker(ch),
+		broker:   newAMQPBroker(conn),
 	}
 	for _, option := range options {
 		option(a)
@@ -63,7 +91,7 @@ func NewAMQP(ch AMQPChannel, cfg AMQPConfig, options ...AMQPOption) *AMQP {
 
 // Schedule 发布延迟消息（header x-delay 毫秒）
 func (a *AMQP) Schedule(ctx context.Context, task Task) error {
-	if err := a.broker.ensureOpen(); err != nil {
+	if err := a.ensureReady(); err != nil {
 		return err
 	}
 	cmd := newAMQPPublish(task, a.clock())
@@ -81,13 +109,13 @@ func (a *AMQP) Cancel(context.Context, string) error {
 
 // Claim 从队列竞争消费。Consume 通道关闭后会重新注册，不绑到单次 Claim 的 ctx。
 func (a *AMQP) Claim(ctx context.Context, n int) ([]Task, error) {
-	if err := a.broker.ensureOpen(); err != nil {
+	if err := a.ensureReady(); err != nil {
 		return nil, err
 	}
 	if n < 1 {
 		n = 1
 	}
-	src, err := a.broker.source(a.topology.consumeQueue())
+	src, err := a.broker.source(a.topology)
 	if err != nil {
 		return nil, err
 	}
@@ -187,21 +215,67 @@ type amqpRoute struct {
 	routingKey string
 }
 
-// amqpBroker 通道适配：发布与 Consume 生命周期。
+// amqpBroker 从连接打开通道：发布与 Consume 生命周期。
 type amqpBroker struct {
-	ch    AMQPChannel
-	mu    sync.Mutex
-	msgCh <-chan amqp.Delivery
+	conn     amqpConn
+	mu       sync.Mutex
+	ch       AMQPChannel
+	msgCh    <-chan amqp.Delivery
+	declared bool
 }
 
-func newAMQPBroker(ch AMQPChannel) *amqpBroker {
-	return &amqpBroker{ch: ch}
+func newAMQPBroker(conn amqpConn) *amqpBroker {
+	return &amqpBroker{conn: conn}
 }
 
-func (b *amqpBroker) ensureOpen() error {
-	if b == nil || b.ch == nil {
+func (a *AMQP) ensureReady() error {
+	if a.broker == nil {
 		return ErrPublishFailed
 	}
+	return a.broker.ensureReady(a.topology)
+}
+
+func (b *amqpBroker) ensureReady(t *amqpTopology) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.readyLocked(t)
+}
+
+func (b *amqpBroker) readyLocked(t *amqpTopology) error {
+	if b.ch == nil {
+		if b.conn == nil {
+			return ErrPublishFailed
+		}
+		ch, err := b.conn.Channel()
+		if err != nil {
+			return err
+		}
+		if ch == nil {
+			return ErrPublishFailed
+		}
+		b.ch = ch
+		b.declared = false
+	}
+	return b.declareLocked(t)
+}
+
+func (b *amqpBroker) declareLocked(t *amqpTopology) error {
+	if b.declared {
+		return nil
+	}
+	if err := b.ch.ExchangeDeclare(t.exchange, "x-delayed-message", true, false, false, false, amqp.Table{
+		"x-delayed-type": "direct",
+	}); err != nil {
+		return err
+	}
+	queue := t.consumeQueue()
+	if _, err := b.ch.QueueDeclare(queue, true, false, false, false, nil); err != nil {
+		return err
+	}
+	if err := b.ch.QueueBind(queue, t.routingKey, t.exchange, false, nil); err != nil {
+		return err
+	}
+	b.declared = true
 	return nil
 }
 
@@ -209,16 +283,16 @@ func (b *amqpBroker) publish(ctx context.Context, route amqpRoute, msg amqp.Publ
 	return b.ch.PublishWithContext(ctx, route.exchange, route.routingKey, false, false, msg)
 }
 
-func (b *amqpBroker) source(queue string) (amqpSource, error) {
+func (b *amqpBroker) source(t *amqpTopology) (amqpSource, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.msgCh != nil {
 		return amqpSource{ch: b.msgCh}, nil
 	}
-	if err := b.ensureOpen(); err != nil {
+	if err := b.readyLocked(t); err != nil {
 		return amqpSource{}, err
 	}
-	ch, err := b.ch.Consume(queue, "", false, false, false, false, nil)
+	ch, err := b.ch.Consume(t.consumeQueue(), "", false, false, false, false, nil)
 	if err != nil {
 		return amqpSource{}, err
 	}
@@ -232,6 +306,8 @@ func (b *amqpBroker) source(queue string) (amqpSource, error) {
 func (b *amqpBroker) drop() {
 	b.mu.Lock()
 	b.msgCh = nil
+	b.ch = nil
+	b.declared = false
 	b.mu.Unlock()
 }
 

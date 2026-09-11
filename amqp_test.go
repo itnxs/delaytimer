@@ -16,6 +16,9 @@ type fakeAMQPChannel struct {
 	pubs       []amqpPublishRec
 	deliveries chan amqp.Delivery
 	consumed   []string
+	exchanges  []amqpExchangeRec
+	queues     []string
+	binds      []amqpBindRec
 }
 
 type amqpPublishRec struct {
@@ -37,6 +40,66 @@ func (c *fakeAMQPChannel) Consume(queue string, _ string, _, _, _, _ bool, _ amq
 	defer c.mu.Unlock()
 	c.consumed = append(c.consumed, queue)
 	return c.deliveries, nil
+}
+
+func (c *fakeAMQPChannel) ExchangeDeclare(name, kind string, _, _, _, _ bool, args amqp.Table) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.exchanges = append(c.exchanges, amqpExchangeRec{name: name, kind: kind, args: args})
+	return nil
+}
+
+func (c *fakeAMQPChannel) QueueDeclare(name string, _, _, _, _ bool, _ amqp.Table) (amqp.Queue, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.queues = append(c.queues, name)
+	return amqp.Queue{Name: name}, nil
+}
+
+func (c *fakeAMQPChannel) QueueBind(name, key, exchange string, _ bool, _ amqp.Table) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.binds = append(c.binds, amqpBindRec{queue: name, key: key, exchange: exchange})
+	return nil
+}
+
+type fakeAMQPConn struct {
+	mu   sync.Mutex
+	n    int
+	ch   AMQPChannel
+	err  error
+	open func() (AMQPChannel, error)
+}
+
+func (c *fakeAMQPConn) Channel() (AMQPChannel, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+	if c.open != nil {
+		return c.open()
+	}
+	if c.err != nil {
+		return nil, c.err
+	}
+	return c.ch, nil
+}
+
+func (c *fakeAMQPConn) opens() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+type amqpExchangeRec struct {
+	name string
+	kind string
+	args amqp.Table
+}
+
+type amqpBindRec struct {
+	queue    string
+	key      string
+	exchange string
 }
 
 type fakeAcknowledger struct {
@@ -71,10 +134,81 @@ func testAMQPConfig() AMQPConfig {
 	}
 }
 
+func amqpStore(ch AMQPChannel, cfg AMQPConfig, opts ...AMQPOption) *AMQP {
+	return newAMQP(&fakeAMQPConn{ch: ch}, cfg, opts...)
+}
+
+func TestAMQPOpensChannelLazilyFromConn(t *testing.T) {
+	ch := &fakeAMQPChannel{}
+	conn := &fakeAMQPConn{ch: ch}
+	a := newAMQP(conn, testAMQPConfig())
+	if conn.opens() != 0 {
+		t.Fatal("Channel should not open at New")
+	}
+	if err := a.Schedule(context.Background(), Task{Key: "k", Kind: "order", Payload: "{}", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if conn.opens() != 1 {
+		t.Fatalf("opens=%d", conn.opens())
+	}
+	if err := a.Schedule(context.Background(), Task{Key: "k2", Kind: "order", Payload: "{}", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if conn.opens() != 1 {
+		t.Fatalf("reuse Channel, opens=%d", conn.opens())
+	}
+	if len(ch.pubs) != 2 {
+		t.Fatalf("pubs=%d", len(ch.pubs))
+	}
+}
+
+func TestAMQPChannelError(t *testing.T) {
+	want := errors.New("channel refused")
+	a := newAMQP(&fakeAMQPConn{err: want}, testAMQPConfig())
+	if err := a.Schedule(context.Background(), Task{}); !errors.Is(err, want) {
+		t.Fatalf("schedule err=%v", err)
+	}
+}
+
+func TestAMQPReopensChannelAfterConsumeClosed(t *testing.T) {
+	closed := make(chan amqp.Delivery)
+	close(closed)
+	live := make(chan amqp.Delivery, 1)
+	okAck := &fakeAcknowledger{}
+	live <- amqp.Delivery{
+		Acknowledger: okAck,
+		Body:         []byte(`{"key":"ok","kind":"order","payload":"{}","at":1}`),
+	}
+	var n int
+	conn := &fakeAMQPConn{open: func() (AMQPChannel, error) {
+		n++
+		if n == 1 {
+			return &fakeAMQPChannel{deliveries: closed}, nil
+		}
+		return &fakeAMQPChannel{deliveries: live}, nil
+	}}
+	a := newAMQP(conn, testAMQPConfig())
+	if _, err := a.Claim(context.Background(), 1); err == nil {
+		t.Fatal("expected closed consume error")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	tasks, err := a.Claim(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("Channel opens=%d", n)
+	}
+	if len(tasks) != 1 || tasks[0].Key != "ok" {
+		t.Fatalf("tasks=%+v", tasks)
+	}
+}
+
 func TestAMQPSchedulePublishesToRoutingKey(t *testing.T) {
 	ch := &fakeAMQPChannel{}
 	now := time.UnixMilli(1_700_000_000_000)
-	a := NewAMQP(ch, testAMQPConfig(), WithAMQPClock(func() time.Time { return now }))
+	a := amqpStore(ch, testAMQPConfig(), WithAMQPClock(func() time.Time { return now }))
 
 	task := Task{Key: "order:1", Kind: "order", Payload: `{"id":1}`, At: now.Add(5 * time.Second)}
 	if err := a.Schedule(context.Background(), task); err != nil {
@@ -109,14 +243,40 @@ func TestAMQPSchedulePublishesToRoutingKey(t *testing.T) {
 	}
 }
 
+func TestAMQPDeclaresTopology(t *testing.T) {
+	ch := &fakeAMQPChannel{}
+	a := amqpStore(ch, testAMQPConfig())
+	if err := a.Schedule(context.Background(), Task{Key: "k", Kind: "order", Payload: "{}", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ch.exchanges) != 1 || ch.exchanges[0].name != "delay.ex" || ch.exchanges[0].kind != "x-delayed-message" {
+		t.Fatalf("exchanges=%+v", ch.exchanges)
+	}
+	if ch.exchanges[0].args["x-delayed-type"] != "direct" {
+		t.Fatalf("args=%v", ch.exchanges[0].args)
+	}
+	if len(ch.queues) != 1 || ch.queues[0] != "delay.q" {
+		t.Fatalf("queues=%v", ch.queues)
+	}
+	if len(ch.binds) != 1 || ch.binds[0] != (amqpBindRec{queue: "delay.q", key: "delay.rk", exchange: "delay.ex"}) {
+		t.Fatalf("binds=%+v", ch.binds)
+	}
+	if err := a.Schedule(context.Background(), Task{Key: "k2", Kind: "order", Payload: "{}", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ch.exchanges) != 1 || len(ch.queues) != 1 || len(ch.binds) != 1 {
+		t.Fatal("topology should be declared once")
+	}
+}
+
 func TestAMQPCancelUnsupported(t *testing.T) {
-	a := NewAMQP(&fakeAMQPChannel{}, testAMQPConfig())
+	a := amqpStore(&fakeAMQPChannel{}, testAMQPConfig())
 	if err := a.Cancel(context.Background(), "k"); !errors.Is(err, ErrCancelUnsupported) {
 		t.Fatalf("err=%v", err)
 	}
 }
 
-func TestAMQPNilChannel(t *testing.T) {
+func TestAMQPNilConnection(t *testing.T) {
 	a := NewAMQP(nil, testAMQPConfig())
 	if err := a.Schedule(context.Background(), Task{}); !errors.Is(err, ErrPublishFailed) {
 		t.Fatalf("schedule err=%v", err)
@@ -134,7 +294,7 @@ func TestAMQPClaimConsumesConfiguredQueue(t *testing.T) {
 		Body:         []byte(`{"key":"order:1","kind":"order","payload":"{}","at":1}`),
 	}
 	ch := &fakeAMQPChannel{deliveries: deliveries}
-	a := NewAMQP(ch, testAMQPConfig())
+	a := amqpStore(ch, testAMQPConfig())
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -164,7 +324,7 @@ func TestAMQPClaimConsumesConfiguredQueue(t *testing.T) {
 func TestAMQPClaimQueueFallsBackToRoutingKey(t *testing.T) {
 	deliveries := make(chan amqp.Delivery)
 	ch := &fakeAMQPChannel{deliveries: deliveries}
-	a := NewAMQP(ch, AMQPConfig{Exchange: "ex", RoutingKey: "rk"})
+	a := amqpStore(ch, AMQPConfig{Exchange: "ex", RoutingKey: "rk"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -184,7 +344,7 @@ func TestAMQPClaimSkipsInvalidPayload(t *testing.T) {
 		Body:         []byte(`{"key":"ok","kind":"order","payload":"{}","at":1}`),
 	}
 	ch := &fakeAMQPChannel{deliveries: deliveries}
-	a := NewAMQP(ch, testAMQPConfig())
+	a := amqpStore(ch, testAMQPConfig())
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -208,7 +368,7 @@ func TestAMQPClaimSkipsInvalidPayload(t *testing.T) {
 func TestAMQPClaimClosedChannel(t *testing.T) {
 	deliveries := make(chan amqp.Delivery)
 	close(deliveries)
-	a := NewAMQP(&fakeAMQPChannel{deliveries: deliveries}, testAMQPConfig())
+	a := amqpStore(&fakeAMQPChannel{deliveries: deliveries}, testAMQPConfig())
 	_, err := a.Claim(context.Background(), 1)
 	if err == nil {
 		t.Fatal("expected closed channel error")
@@ -223,7 +383,7 @@ func TestAMQPClaimClosedAfterPartial(t *testing.T) {
 		Body:         []byte(`{"key":"ok","kind":"order","payload":"{}","at":1}`),
 	}
 	close(deliveries)
-	a := NewAMQP(&fakeAMQPChannel{deliveries: deliveries}, testAMQPConfig())
+	a := amqpStore(&fakeAMQPChannel{deliveries: deliveries}, testAMQPConfig())
 	tasks, err := a.Claim(context.Background(), 2)
 	if err != nil {
 		t.Fatal(err)
@@ -236,7 +396,7 @@ func TestAMQPClaimClosedAfterPartial(t *testing.T) {
 func TestAMQPAckFailRelease(t *testing.T) {
 	ack := &fakeAcknowledger{}
 	task := Task{ack: &amqpDeliveryAck{d: amqp.Delivery{Acknowledger: ack}}}
-	a := NewAMQP(&fakeAMQPChannel{}, testAMQPConfig())
+	a := amqpStore(&fakeAMQPChannel{}, testAMQPConfig())
 	if err := a.Ack(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +436,7 @@ func TestAMQPFailRepublishesAfterClaimAck(t *testing.T) {
 	}
 	ch := &fakeAMQPChannel{deliveries: deliveries}
 	now := time.UnixMilli(1_700_000_000_000)
-	a := NewAMQP(ch, testAMQPConfig(), WithAMQPClock(func() time.Time { return now }))
+	a := amqpStore(ch, testAMQPConfig(), WithAMQPClock(func() time.Time { return now }))
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

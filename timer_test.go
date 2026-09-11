@@ -199,7 +199,7 @@ func TestTimerAMQPAckOnUnknownKind(t *testing.T) {
 		Acknowledger: ack,
 		Body:         []byte(`{"key":"x","kind":"missing","payload":"{}","at":1}`),
 	}
-	store := NewAMQP(&fakeAMQPChannel{deliveries: deliveries}, testAMQPConfig())
+	store := amqpStore(&fakeAMQPChannel{deliveries: deliveries}, testAMQPConfig())
 	timer := New(store, WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
 	t.Cleanup(timer.Close)
 	if err := timer.Start(context.Background()); err != nil {

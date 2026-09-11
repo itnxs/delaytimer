@@ -10,7 +10,7 @@ _ = t.SetEvent(time.Now().Add(time.Minute), params)
 _ = t.DelEvent(params)
 ```
 
-完整可运行示例见 [`example/memory`](example/memory)。
+完整可运行示例见 [`example/memory`](example/memory)、[`example/redis`](example/redis)、[`example/amqp`](example/amqp)。
 
 `Start` 在内部起 goroutine；`Close` 会取消并等待退出。
 
@@ -60,9 +60,47 @@ Handler 返回错误时：
 |---|---|---|---|---|
 | Memory | `NewMemory()` | 无到期任务时阻塞到 ctx 取消 | 支持 | 进程内，不跨进程 |
 | Redis | `NewRedis(cmd, zsetKey)` | 立即返回，靠 `WithPollInterval` 轮询 | 支持 | 单 ZSET，ZREM 竞争领取 |
-| AMQP | `NewAMQP(ch, AMQPConfig{...})` | 从队列消费；第一条可阻塞 | **不支持**（`ErrCancelUnsupported`） | 调用方声明 x-delayed-message 交换机；领取后立刻 Ack |
+| AMQP | `NewAMQP(conn, AMQPConfig{...})` | 从队列消费；第一条可阻塞 | **不支持**（`ErrCancelUnsupported`） | 内部开 Channel 并声明 x-delayed-message 交换机；领取后立刻 Ack |
 
-AMQP：`Queue` 为空时消费 `RoutingKey`。`DelEvent` 会得到 `ErrCancelUnsupported`。
+Redis 示例（Claim 不阻塞，需要 `WithPollInterval` 轮询）：
+
+```go
+rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+defer rdb.Close()
+
+t := delaytimer.New(
+    delaytimer.NewRedis(rdb, "delaytimer:jobs"),
+    delaytimer.WithHandlers(h),
+    delaytimer.WithPollInterval(100*time.Millisecond),
+)
+defer t.Close()
+_ = t.Start(ctx)
+_ = t.SetEvent(time.Now().Add(time.Minute), params)
+_ = t.DelEvent(params)
+```
+
+`NewRedis` 的第二个参数是 ZSET 名。多副本用同一个 key 即可竞争领取。
+
+AMQP 示例（首次使用时内部打开 Channel，并声明 x-delayed-message 交换机、队列并绑定；`DelEvent` 不支持）：
+
+```go
+conn, err := amqp.Dial("amqp://guest:guest@127.0.0.1:5672/")
+defer conn.Close()
+
+t := delaytimer.New(
+    delaytimer.NewAMQP(conn, delaytimer.AMQPConfig{
+        Exchange:   "delay.ex",
+        RoutingKey: "delay.rk",
+        Queue:      "delay.q",
+    }),
+    delaytimer.WithHandlers(h),
+)
+defer t.Close()
+_ = t.Start(ctx)
+_ = t.SetEvent(time.Now().Add(time.Minute), params)
+```
+
+需要 RabbitMQ 插件 `rabbitmq_delayed_message_exchange`。`Queue` 为空时消费 `RoutingKey`。
 
 ## 任务身份
 
