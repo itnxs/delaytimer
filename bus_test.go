@@ -35,6 +35,31 @@ func TestEventChannelPublishFailed(t *testing.T) {
 	}
 }
 
+func TestEventChannelCloseDoesNotWaitForPublish(t *testing.T) {
+	ch := newEventChannel(1, 2*time.Second)
+	if err := ch.Publish("a"); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_ = ch.Publish("b")
+	}()
+	<-started
+	time.Sleep(30 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		ch.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("Close blocked behind Publish")
+	}
+}
+
 func TestSubscribeNilSafe(t *testing.T) {
 	Subscribe(nil, nil)
 	timer := New(&fakeStore{}, WithLogger(silentLogger()))
@@ -51,11 +76,10 @@ func TestSubscribeSetAndDel(t *testing.T) {
 	if err := timer.SetEvent(at, p); err != nil {
 		t.Fatal(err)
 	}
-	waitUntil(t, 2*time.Second, func() bool {
-		scheduled, _, _, _ := store.snapshot()
-		return len(scheduled) == 1
-	})
 	scheduled, _, _, _ := store.snapshot()
+	if len(scheduled) != 1 {
+		t.Fatalf("expected sync schedule, got %d", len(scheduled))
+	}
 	payload, err := encodeParams(p)
 	if err != nil {
 		t.Fatal(err)
@@ -68,12 +92,8 @@ func TestSubscribeSetAndDel(t *testing.T) {
 	if err := timer.DelEvent(p); err != nil {
 		t.Fatal(err)
 	}
-	waitUntil(t, 2*time.Second, func() bool {
-		_, canceled, _, _ := store.snapshot()
-		return len(canceled) == 1
-	})
 	_, canceled, _, _ := store.snapshot()
-	if canceled[0] != wantKey {
+	if len(canceled) != 1 || canceled[0] != wantKey {
 		t.Fatalf("canceled=%v", canceled)
 	}
 }

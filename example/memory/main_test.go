@@ -43,7 +43,6 @@ func TestMemoryEventTimer(t *testing.T) {
 	if err := timer.SetEvent(time.Now().Add(time.Hour), skip); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(200 * time.Millisecond)
 	if err := timer.DelEvent(skip); err != nil {
 		t.Fatal(err)
 	}

@@ -154,7 +154,6 @@ func TestTimerSetEventAndDelEvent(t *testing.T) {
 	if err := timer.SetEvent(time.Now().Add(time.Hour), skip); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(200 * time.Millisecond)
 	if err := timer.DelEvent(skip); err != nil {
 		t.Fatal(err)
 	}
@@ -174,4 +173,97 @@ func TestTimerSetEventNilParams(t *testing.T) {
 	if err := timer.DelEvent(nil); !errors.Is(err, ErrNilParam) {
 		t.Fatalf("del=%v", err)
 	}
+}
+
+func TestTimerSetEventWritesStoreImmediately(t *testing.T) {
+	store := &fakeStore{}
+	timer := New(store, WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	at := time.Unix(1000, 0)
+	p := &sampleParams{ID: "1"}
+	if err := timer.SetEvent(at, p); err != nil {
+		t.Fatal(err)
+	}
+	scheduled, _, _, _ := store.snapshot()
+	if len(scheduled) != 1 {
+		t.Fatalf("expected sync schedule, got %d", len(scheduled))
+	}
+	payload, err := encodeParams(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKey := "sample:" + payload
+	if scheduled[0].Key != wantKey || scheduled[0].At != at {
+		t.Fatalf("task=%+v", scheduled[0])
+	}
+	if err := timer.DelEvent(p); err != nil {
+		t.Fatal(err)
+	}
+	_, canceled, _, _ := store.snapshot()
+	if len(canceled) != 1 || canceled[0] != wantKey {
+		t.Fatalf("canceled=%v", canceled)
+	}
+}
+
+func TestTimerCloseStopsRun(t *testing.T) {
+	timer := New(NewMemory(), WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
+	done := make(chan error, 1)
+	go func() { done <- timer.Run(context.Background()) }()
+	time.Sleep(30 * time.Millisecond)
+	timer.Close()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("run=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close should stop Run")
+	}
+}
+
+func TestTimerSetEventAfterClose(t *testing.T) {
+	timer := New(&fakeStore{}, WithLogger(silentLogger()))
+	timer.Close()
+	if err := timer.SetEvent(time.Now(), &sampleParams{ID: "1"}); !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("set=%v", err)
+	}
+	if err := timer.DelEvent(&sampleParams{ID: "1"}); !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("del=%v", err)
+	}
+}
+
+func TestDispatchPanicReturnsError(t *testing.T) {
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
+		panic("boom")
+	})
+	timer := New(&fakeStore{}, WithHandlers(h), WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	err := timer.dispatch(context.Background(), sampleTaskAt(time.Unix(1, 0)))
+	if err == nil {
+		t.Fatal("panic should return error")
+	}
+}
+
+func TestTimerRunConcurrentDispatch(t *testing.T) {
+	now := time.Unix(1, 0)
+	claims := make([]Task, 8)
+	for i := range claims {
+		p := &sampleParams{ID: string(rune('a' + i))}
+		payload, err := encodeParams(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claims[i] = Task{Key: "sample:" + payload, Kind: "sample", Payload: payload, At: now}
+	}
+	store := &fakeStore{claims: claims}
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error { return nil })
+	timer := New(store, WithHandlers(h), WithLogger(silentLogger()), WithPollInterval(time.Millisecond), WithConcurrency(8), WithBatchSize(8))
+	t.Cleanup(timer.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = timer.Run(ctx) }()
+	waitUntil(t, 2*time.Second, func() bool {
+		_, _, ackN, _ := store.snapshot()
+		return ackN == 8
+	})
 }
