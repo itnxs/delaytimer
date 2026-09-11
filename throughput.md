@@ -94,3 +94,28 @@ RESULT backend=TestStoreThroughput/amqp n=10000 publish_err=0 publish_ms=364.0 p
 - **AMQP** 远程 576 主要是 RTT + 延迟插件 + 单 Channel。本机 Docker 后投递到 **8k～27k**，说明库侧发布池和已到期直投是够用的；远程几百到两千是网络和集群负载。本机消费大约 **4k**，领取仍是单消费 Channel。未到期任务仍走 `x-delayed-message` 插件，会比这组已到期数字慢。
 
 生产若 Handler 有 IO，消费会先打满下游。加副本、加大 `WithConcurrency` / `WithBatchSize`，或 Redis 缩短 `WithPollInterval`，都可能改变结果。
+
+## 丢数对账（本机，2026-09-11）
+
+Memory 只能单进程（任务在进程内堆里）。Redis / AMQP 为 4 投递进程 + 4 消费进程。均为 10,000 条唯一 ID。
+
+```bash
+go test -tags throughput -run '^TestStoreMultiProcessLoss$/memory$' -count=1 -timeout 3m -v
+
+AMQP_URL='amqp://guest:guest@127.0.0.1:5672/' \
+  go test -tags throughput -run '^TestStoreMultiProcessLoss$' -count=1 -timeout 5m -v
+```
+
+| 后端 | 投递进程 | 消费进程 | 投递成功 | 消费唯一 | Handle 次数 | 丢失 | 重复 | 残留 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Memory | 1 | 1 | 10,000 | 10,000 | 10,000 | 0 | 0 | 0 |
+| Redis | 4 | 4 | 10,000 | 10,000 | 10,000 | 0 | 0 | 0 |
+| AMQP | 4 | 4 | 10,000 | 10,000 | 10,000 | 0 | 0 | 0 |
+
+```
+LOSS backend=memory processes=prod:1/cons:1 want=10000 published=10000 consumed_unique=10000 handle_hits=10000 missing=0 extra=0 dup=0 leftover=0
+LOSS backend=redis processes=prod:4/cons:4 want=10000 published=10000 consumed_unique=10000 handle_hits=10000 missing=0 extra=0 dup=0 leftover=0
+LOSS backend=amqp processes=prod:4/cons:4 want=10000 published=10000 consumed_unique=10000 handle_hits=10000 missing=0 extra=0 dup=0 leftover=0
+```
+
+对照下 Memory 单进程与 Redis/AMQP 多进程一样：没有丢数、没有重复。库语义是领取后即删/Ack（at-most-once）。
