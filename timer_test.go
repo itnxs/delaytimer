@@ -371,6 +371,34 @@ func TestTimerSetEventAfterClose(t *testing.T) {
 	}
 }
 
+func TestTimerCloseClosesAMQPChannels(t *testing.T) {
+	var chans []*fakeAMQPChannel
+	conn := &fakeAMQPConn{open: func() (AMQPChannel, error) {
+		ch := &fakeAMQPChannel{deliveries: make(chan amqp.Delivery)}
+		chans = append(chans, ch)
+		return ch, nil
+	}}
+	store := newAMQP(conn, testAMQPConfig())
+	timer := New(store, WithLogger(silentLogger()), WithPollInterval(time.Millisecond))
+	if err := timer.SetEvent(time.Now().Add(time.Hour), &sampleParams{ID: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, time.Second, func() bool { return conn.opens() >= 2 })
+	timer.Close()
+	if len(chans) < 2 {
+		t.Fatalf("channels=%d", len(chans))
+	}
+	if chans[0].closes() != 1 {
+		t.Fatalf("pub closeN=%d", chans[0].closes())
+	}
+	if chans[1].closes() != 1 {
+		t.Fatalf("sub closeN=%d", chans[1].closes())
+	}
+}
+
 func TestDispatchPanicReturnsError(t *testing.T) {
 	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
 		panic("boom")

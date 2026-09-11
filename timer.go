@@ -82,14 +82,19 @@ func (t *Timer) Start(ctx context.Context) error {
 	return nil
 }
 
-// Close 停止 Start：取消并等待循环退出。若启用了 Bus 则关闭其通道。可重复调用。
-// 关闭后 SetEvent / DelEvent 返回 ErrChannelClosed。
+// Close 停止 Start：取消并等待循环退出，然后关闭 Store（AMQP 会关掉内部 Channel）。
+// 若启用了 Bus 则关闭其通道。可重复调用。关闭后 SetEvent / DelEvent 返回 ErrChannelClosed。
 func (t *Timer) Close() {
 	if t == nil {
 		return
 	}
 	t.stop()
 	t.done.Wait()
+	if t.store != nil {
+		if err := t.store.Close(); err != nil {
+			t.logger.WithError(err).Error("store close failed")
+		}
+	}
 }
 
 // SetEvent 投递延迟任务。未配置 Bus 时同步写入 Store；
@@ -292,16 +297,16 @@ func (t *Timer) dispatch(ctx context.Context, task Task) (err error) {
 
 	h, ok := t.handlers[Event(task.Kind)]
 	if !ok {
-		return errors.New("unknown kind, discarded")
+		return errors.Wrapf(ErrUnknownKind, "%s", task.Kind)
 	}
 
 	inst := h.NewParams()
 	if !isPointerParams(inst) {
-		return errors.New("params is not a pointer, discarded")
+		return errors.WithStack(ErrNilParam)
 	}
 
 	if err := decodeParams(task.Payload, inst); err != nil {
-		return errors.New("unmarshal params failed, discarded")
+		return err
 	}
 
 	t.logger.WithFields(logrus.Fields{

@@ -64,6 +64,9 @@ func (m *Memory) Claim(ctx context.Context, n int) ([]Task, error) {
 // Ack 内存后端在 Claim 时已移除任务
 func (m *Memory) Ack(context.Context, Task) error { return nil }
 
+// Close 内存后端无需释放
+func (m *Memory) Close() error { return nil }
+
 // Fail 重新入队；若同 Key 已被新 Schedule 覆盖则不改写
 func (m *Memory) Fail(_ context.Context, task Task) error {
 	m.agenda.requeueUnlessPresent(task, m.clock().Add(failRequeueDelay))
@@ -135,10 +138,15 @@ func (a *memoryAgenda) claim(ctx context.Context, n int, clock Clock) ([]Task, e
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if due := a.takeDue(clock(), n); len(due) > 0 {
+		now := clock()
+		if due := a.takeDue(now, n); len(due) > 0 {
 			return due, nil
 		}
-		a.await(a.waitDuration(clock()))
+		wait, block := a.sleepFor(now)
+		if !block {
+			continue
+		}
+		a.await(wait)
 	}
 }
 
@@ -168,16 +176,19 @@ func (a *memoryAgenda) takeDue(now time.Time, n int) []Task {
 	return out
 }
 
-func (a *memoryAgenda) waitDuration(now time.Time) time.Duration {
+func (a *memoryAgenda) sleepFor(now time.Time) (time.Duration, bool) {
 	head := a.queue.peek()
-	if head == nil || head.due(now) {
-		return 0
+	if head == nil {
+		return 0, true
+	}
+	if head.due(now) {
+		return 0, false
 	}
 	d := head.dueAt().Sub(now)
 	if d > memoryWakeInterval {
-		return memoryWakeInterval
+		return memoryWakeInterval, true
 	}
-	return d
+	return d, true
 }
 
 func (a *memoryAgenda) watch(ctx context.Context) func() {
@@ -185,7 +196,7 @@ func (a *memoryAgenda) watch(ctx context.Context) func() {
 	go func() {
 		select {
 		case <-ctx.Done():
-			a.notify()
+			a.signal()
 		case <-stop:
 		}
 	}()
@@ -197,13 +208,19 @@ func (a *memoryAgenda) await(wait time.Duration) {
 		a.cond.Wait()
 		return
 	}
-	timer := time.AfterFunc(wait, a.notify)
+	timer := time.AfterFunc(wait, a.signal)
 	a.cond.Wait()
 	timer.Stop()
 }
 
 func (a *memoryAgenda) notify() {
 	a.cond.Broadcast()
+}
+
+func (a *memoryAgenda) signal() {
+	a.mu.Lock()
+	a.cond.Broadcast()
+	a.mu.Unlock()
 }
 
 // scheduledTask 日程中的任务实体，身份为 Task.Key。

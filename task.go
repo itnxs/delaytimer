@@ -39,6 +39,8 @@ type (
 		Ack(ctx context.Context, task Task) error
 		// Fail Handler 失败后重新入队。Timer 仅在 FailRequeue 时调用。
 		Fail(ctx context.Context, task Task) error
+		// Close 释放后端。Memory / Redis 为空操作；AMQP 关闭内部打开的 Channel。
+		Close() error
 	}
 
 	// Task 后端任务

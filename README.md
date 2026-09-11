@@ -12,7 +12,7 @@ _ = t.DelEvent(params)
 
 完整可运行示例见 [`example/memory`](example/memory)、[`example/redis`](example/redis)、[`example/amqp`](example/amqp)。
 
-`Start` 在内部起 goroutine；`Close` 会取消并等待退出。
+`Start` 在内部起 goroutine；`Close` 会取消并等待退出。AMQP 后端还会关掉库打开的 Channel（连接仍由调用方 `Close`）。
 
 ## 投递与取消
 
@@ -60,7 +60,7 @@ Handler 返回错误时：
 |---|---|---|---|---|
 | Memory | `NewMemory()` | 无到期任务时阻塞到 ctx 取消 | 支持 | 进程内，不跨进程 |
 | Redis | `NewRedis(cmd, zsetKey)` | 立即返回，靠 `WithPollInterval` 轮询 | 支持 | 单 ZSET，ZREM 竞争领取 |
-| AMQP | `NewAMQP(conn, AMQPConfig{...})` | 从队列消费；第一条可阻塞 | **不支持**（`ErrCancelUnsupported`） | 内部开 Channel 并声明 x-delayed-message 交换机；领取后立刻 Ack |
+| AMQP | `NewAMQP(conn, AMQPConfig{...})` | 从队列消费；第一条可阻塞 | **不支持**（`ErrCancelUnsupported`） | 发布与消费各开一条 Channel；内部声明 x-delayed-message；领取后立刻 Ack |
 
 Redis 示例（Claim 不阻塞，需要 `WithPollInterval` 轮询）：
 

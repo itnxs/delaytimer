@@ -86,6 +86,8 @@ func (s *fakeStore) Fail(context.Context, Task) error {
 	return nil
 }
 
+func (s *fakeStore) Close() error { return nil }
+
 func (s *fakeStore) snapshot() (scheduled []Task, canceled []string, ackN, failN int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

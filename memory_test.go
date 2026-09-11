@@ -41,6 +41,47 @@ func TestMemoryClaimNotDueBlocksUntilCancel(t *testing.T) {
 	}
 }
 
+func TestMemoryClaimWhenDueBetweenClockReads(t *testing.T) {
+	at := time.Unix(10, 0)
+	var n int
+	m := NewMemory(WithMemoryClock(func() time.Time {
+		n++
+		if n == 1 {
+			return at.Add(-time.Nanosecond)
+		}
+		return at
+	}))
+	if err := m.Schedule(context.Background(), Task{Key: "k", Kind: "x", Payload: "p", At: at}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	got, err := m.Claim(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Key != "k" {
+		t.Fatalf("got=%+v", got)
+	}
+}
+
+func TestMemoryClaimWakesWhenTaskBecomesDue(t *testing.T) {
+	m := NewMemory()
+	at := time.Now().Add(25 * time.Millisecond)
+	if err := m.Schedule(context.Background(), Task{Key: "k", Kind: "x", Payload: "p", At: at}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := m.Claim(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Key != "k" {
+		t.Fatalf("got=%+v", got)
+	}
+}
+
 func TestMemoryScheduleOverwrite(t *testing.T) {
 	now := time.Unix(1000, 0)
 	m := NewMemory(WithMemoryClock(func() time.Time { return now }))

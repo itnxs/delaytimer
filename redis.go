@@ -111,6 +111,9 @@ func (r *Redis) Claim(ctx context.Context, n int) ([]Task, error) {
 // Ack 领取时已从 ZSET 删除
 func (r *Redis) Ack(context.Context, Task) error { return nil }
 
+// Close Redis 后端不关闭传入的客户端
+func (r *Redis) Close() error { return nil }
+
 // Fail 重新入队；若同 member 已被新 Schedule 覆盖则不改写
 func (r *Redis) Fail(ctx context.Context, task Task) error {
 	at := float64(r.nowMilli(ctx) + failRequeueDelay.Milliseconds())

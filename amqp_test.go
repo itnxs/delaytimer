@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,13 +13,17 @@ import (
 )
 
 type fakeAMQPChannel struct {
-	mu         sync.Mutex
-	pubs       []amqpPublishRec
-	deliveries chan amqp.Delivery
-	consumed   []string
-	exchanges  []amqpExchangeRec
-	queues     []string
-	binds      []amqpBindRec
+	mu           sync.Mutex
+	pubs         []amqpPublishRec
+	deliveries   chan amqp.Delivery
+	consumed     []string
+	exchanges    []amqpExchangeRec
+	queues       []string
+	binds        []amqpBindRec
+	publishDelay time.Duration
+	inFlight     int32
+	overlap      int32
+	closeN       int
 }
 
 type amqpPublishRec struct {
@@ -28,11 +33,32 @@ type amqpPublishRec struct {
 }
 
 func (c *fakeAMQPChannel) PublishWithContext(_ context.Context, exchange, key string, _, _ bool, msg amqp.Publishing) error {
+	if n := atomic.AddInt32(&c.inFlight, 1); n > 1 {
+		atomic.AddInt32(&c.overlap, 1)
+	}
+	if d := c.publishDelay; d > 0 {
+		time.Sleep(d)
+	}
+	defer atomic.AddInt32(&c.inFlight, -1)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	msg.Body = append([]byte(nil), msg.Body...)
 	c.pubs = append(c.pubs, amqpPublishRec{exchange: exchange, key: key, msg: msg})
 	return nil
+}
+
+func (c *fakeAMQPChannel) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closeN++
+	return nil
+}
+
+func (c *fakeAMQPChannel) closes() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closeN
 }
 
 func (c *fakeAMQPChannel) Consume(queue string, _ string, _, _, _, _ bool, _ amqp.Table) (<-chan amqp.Delivery, error) {
@@ -158,6 +184,67 @@ func TestAMQPOpensChannelLazilyFromConn(t *testing.T) {
 		t.Fatalf("reuse Channel, opens=%d", conn.opens())
 	}
 	if len(ch.pubs) != 2 {
+		t.Fatalf("pubs=%d", len(ch.pubs))
+	}
+}
+
+func TestAMQPSeparatesPublishAndConsumeChannels(t *testing.T) {
+	var chans []*fakeAMQPChannel
+	conn := &fakeAMQPConn{open: func() (AMQPChannel, error) {
+		ch := &fakeAMQPChannel{deliveries: make(chan amqp.Delivery)}
+		chans = append(chans, ch)
+		return ch, nil
+	}}
+	a := newAMQP(conn, testAMQPConfig())
+	if err := a.Schedule(context.Background(), Task{Key: "k", Kind: "order", Payload: "{}", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(chans) != 1 {
+		t.Fatalf("publish should open 1 channel, got %d", len(chans))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = a.Claim(ctx, 1)
+	if len(chans) != 2 {
+		t.Fatalf("publish and consume should use separate channels, got %d", len(chans))
+	}
+	if len(chans[0].pubs) != 1 {
+		t.Fatalf("publish channel pubs=%d", len(chans[0].pubs))
+	}
+	if len(chans[0].consumed) != 0 {
+		t.Fatalf("publish channel should not Consume: %v", chans[0].consumed)
+	}
+	if len(chans[1].consumed) != 1 {
+		t.Fatalf("consume channel consumed=%v", chans[1].consumed)
+	}
+	if len(chans[1].pubs) != 0 {
+		t.Fatalf("consume channel should not Publish: %d", len(chans[1].pubs))
+	}
+}
+
+func TestAMQPSerializesConcurrentPublish(t *testing.T) {
+	ch := &fakeAMQPChannel{publishDelay: 20 * time.Millisecond}
+	a := amqpStore(ch, testAMQPConfig())
+	var wg sync.WaitGroup
+	errCh := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- a.Schedule(context.Background(), Task{Key: "k", Kind: "order", Payload: "{}", At: time.Now()})
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if atomic.LoadInt32(&ch.overlap) != 0 {
+		t.Fatalf("Publish overlapped on same channel: overlap=%d", ch.overlap)
+	}
+	if len(ch.pubs) != 8 {
 		t.Fatalf("pubs=%d", len(ch.pubs))
 	}
 }
@@ -463,5 +550,76 @@ func TestAMQPFailRepublishesAfterClaimAck(t *testing.T) {
 	delay, _ := ch.pubs[0].msg.Headers["x-delay"].(int64)
 	if delay != failRequeueDelay.Milliseconds() {
 		t.Fatalf("x-delay=%v", ch.pubs[0].msg.Headers["x-delay"])
+	}
+}
+
+func TestAMQPCloseClosesPublishAndConsumeChannels(t *testing.T) {
+	var chans []*fakeAMQPChannel
+	conn := &fakeAMQPConn{open: func() (AMQPChannel, error) {
+		ch := &fakeAMQPChannel{deliveries: make(chan amqp.Delivery)}
+		chans = append(chans, ch)
+		return ch, nil
+	}}
+	a := newAMQP(conn, testAMQPConfig())
+	if err := a.Schedule(context.Background(), Task{Key: "k", Kind: "order", Payload: "{}", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = a.Claim(ctx, 1)
+	if len(chans) != 2 {
+		t.Fatalf("channels=%d", len(chans))
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if chans[0].closes() != 1 {
+		t.Fatalf("pub closeN=%d", chans[0].closes())
+	}
+	if chans[1].closes() != 1 {
+		t.Fatalf("sub closeN=%d", chans[1].closes())
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if chans[0].closes() != 1 || chans[1].closes() != 1 {
+		t.Fatal("Close should be idempotent")
+	}
+	if err := a.Schedule(context.Background(), Task{Key: "k2", Kind: "order", Payload: "{}", At: time.Now()}); !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("schedule after close=%v", err)
+	}
+	if _, err := a.Claim(context.Background(), 1); !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("claim after close=%v", err)
+	}
+}
+
+func TestAMQPCloseDoesNotDoubleCloseDroppedConsume(t *testing.T) {
+	closed := make(chan amqp.Delivery)
+	close(closed)
+	var chans []*fakeAMQPChannel
+	conn := &fakeAMQPConn{open: func() (AMQPChannel, error) {
+		ch := &fakeAMQPChannel{deliveries: closed}
+		chans = append(chans, ch)
+		return ch, nil
+	}}
+	a := newAMQP(conn, testAMQPConfig())
+	if err := a.Schedule(context.Background(), Task{Key: "k", Kind: "order", Payload: "{}", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = a.Claim(context.Background(), 1)
+	if len(chans) != 2 {
+		t.Fatalf("channels=%d", len(chans))
+	}
+	if chans[1].closes() != 1 {
+		t.Fatalf("drop should close consume channel, closeN=%d", chans[1].closes())
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if chans[0].closes() != 1 {
+		t.Fatalf("pub closeN=%d", chans[0].closes())
+	}
+	if chans[1].closes() != 1 {
+		t.Fatalf("consume should not Close twice, closeN=%d", chans[1].closes())
 	}
 }
