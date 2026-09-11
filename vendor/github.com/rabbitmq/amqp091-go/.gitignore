@@ -1,0 +1,14 @@
+# Certificates
+certs/*
+
+# Specs
+spec/spec
+
+# Example binaries
+_examples/consumer/consumer
+_examples/producer/producer
+_examples/client/client
+_examples/pubsub/pubsub
+
+# IDEs and Editors
+.idea/
