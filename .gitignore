@@ -1,0 +1,7 @@
+vendor/*
+vendor/
+.idea/
+revive.sh
+.vscode
+.DS_Store
+.opencode/
