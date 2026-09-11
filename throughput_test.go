@@ -79,7 +79,7 @@ func TestStoreThroughput(t *testing.T) {
 		t.Cleanup(func() { _ = conn.Close() })
 		name := fmt.Sprintf("delaytimer.throughput.%d", time.Now().UnixNano())
 		reportThroughput(t, runThroughput(t, n, workers, func() (Store, func()) {
-			return NewAMQP(conn, AMQPConfig{Exchange: name, RoutingKey: name, Queue: name}), func() {}
+			return NewAMQP(conn, AMQPConfig{Exchange: name, RoutingKey: name, Queue: name}, WithAMQPPublishChannels(workers)), func() {}
 		}))
 	})
 }

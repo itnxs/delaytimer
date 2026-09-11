@@ -222,9 +222,57 @@ func TestAMQPSeparatesPublishAndConsumeChannels(t *testing.T) {
 	}
 }
 
+func TestAMQPConcurrentPublishUsesPool(t *testing.T) {
+	var mu sync.Mutex
+	var chans []*fakeAMQPChannel
+	conn := &fakeAMQPConn{open: func() (AMQPChannel, error) {
+		ch := &fakeAMQPChannel{publishDelay: 30 * time.Millisecond}
+		mu.Lock()
+		chans = append(chans, ch)
+		mu.Unlock()
+		return ch, nil
+	}}
+	a := newAMQP(conn, testAMQPConfig(), WithAMQPPublishChannels(4))
+	start := time.Now()
+	var wg sync.WaitGroup
+	errCh := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- a.Schedule(context.Background(), Task{Key: "k", Kind: "order", Payload: "{}", At: time.Now()})
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if conn.opens() != 4 {
+		t.Fatalf("opens=%d want 4", conn.opens())
+	}
+	var pubs int
+	for _, ch := range chans {
+		if atomic.LoadInt32(&ch.overlap) != 0 {
+			t.Fatalf("Publish overlapped on same channel")
+		}
+		ch.mu.Lock()
+		pubs += len(ch.pubs)
+		ch.mu.Unlock()
+	}
+	if pubs != 8 {
+		t.Fatalf("pubs=%d", pubs)
+	}
+	if elapsed := time.Since(start); elapsed > 180*time.Millisecond {
+		t.Fatalf("elapsed=%s, pool should publish across channels", elapsed)
+	}
+}
+
 func TestAMQPSerializesConcurrentPublish(t *testing.T) {
 	ch := &fakeAMQPChannel{publishDelay: 20 * time.Millisecond}
-	a := amqpStore(ch, testAMQPConfig())
+	a := amqpStore(ch, testAMQPConfig(), WithAMQPPublishChannels(1))
 	var wg sync.WaitGroup
 	errCh := make(chan error, 8)
 	for i := 0; i < 8; i++ {
@@ -320,6 +368,9 @@ func TestAMQPSchedulePublishesToRoutingKey(t *testing.T) {
 	delay, _ = ch.pubs[1].msg.Headers["x-delay"].(int64)
 	if delay != 0 {
 		t.Fatalf("past x-delay=%v", ch.pubs[1].msg.Headers["x-delay"])
+	}
+	if ch.pubs[1].exchange != "" || ch.pubs[1].key != "delay.q" {
+		t.Fatalf("due route=%s/%s", ch.pubs[1].exchange, ch.pubs[1].key)
 	}
 	var msg amqpMessage
 	if err := json.Unmarshal(rec.msg.Body, &msg); err != nil {

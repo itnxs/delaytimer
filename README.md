@@ -62,7 +62,7 @@ Handler 返回错误时：
 |---|---|---|---|---|
 | Memory | `NewMemory()` | 无到期任务时阻塞到 ctx 取消 | 支持 | 进程内，不跨进程 |
 | Redis | `NewRedis(cmd, zsetKey)` | 立即返回，靠 `WithPollInterval` 轮询 | 支持 | 单 ZSET，Lua 一次领取（ZRANGEBYSCORE + ZREM） |
-| AMQP | `NewAMQP(conn, AMQPConfig{...})` | 从队列消费；第一条可阻塞 | **不支持**（`ErrCancelUnsupported`） | 发布与消费各开一条 Channel；内部声明 x-delayed-message；领取后立刻 Ack |
+| AMQP | `NewAMQP(conn, AMQPConfig{...})` | 从队列消费；第一条可阻塞 | **不支持**（`ErrCancelUnsupported`） | 发布默认 8 条 Channel 并行（`WithAMQPPublishChannels`）；消费单独一条；内部声明 x-delayed-message；领取后立刻 Ack |
 
 Redis 示例（Claim 不阻塞，需要 `WithPollInterval` 轮询）：
 
@@ -83,7 +83,7 @@ _ = t.DelEvent(params)
 
 `NewRedis` 的第二个参数是 ZSET 名。
 
-AMQP 示例（首次使用时内部打开 Channel，并声明 x-delayed-message 交换机、队列并绑定；`DelEvent` 不支持）：
+AMQP 示例（首次使用时内部打开 Channel，并声明 x-delayed-message 交换机、队列并绑定；`DelEvent` 不支持）。发布默认 8 条 Channel，可用 `WithAMQPPublishChannels` 调整：
 
 ```go
 conn, err := amqp.Dial("amqp://guest:guest@127.0.0.1:5672/")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -53,6 +54,18 @@ func WithAMQPClock(c Clock) AMQPOption {
 	}
 }
 
+const defaultAMQPPublishChannels = 8
+
+// WithAMQPPublishChannels 发布 Channel 池大小。amqp091 的 Channel 不能跨 goroutine，
+// 池内每条 Channel 单独加锁；默认 8。设为 1 则全进程串行发布。
+func WithAMQPPublishChannels(n int) AMQPOption {
+	return func(a *AMQP) {
+		if n > 0 && a.broker != nil {
+			a.broker.pubN = n
+		}
+	}
+}
+
 // amqpConn 能从连接打开 Channel。*amqp.Connection 经 NewAMQP 包装后满足。
 type amqpConn interface {
 	Channel() (AMQPChannel, error)
@@ -70,7 +83,7 @@ func (c *amqpConnection) Channel() (AMQPChannel, error) {
 }
 
 // NewAMQP 新建 AMQP 后端。conn 由调用方 Dial / Close；内部自行打开 Channel。
-// 发布与消费各用一条 Channel，Publish 串行。Cancel / DelEvent 恒为 ErrCancelUnsupported。
+// 发布默认 8 条 Channel 并行（单 Channel 内仍串行）；消费单独一条。Cancel / DelEvent 恒为 ErrCancelUnsupported。
 // 首次使用时声明 x-delayed-message 交换机（x-delayed-type=direct）、队列并绑定。
 func NewAMQP(conn *amqp.Connection, cfg AMQPConfig, options ...AMQPOption) *AMQP {
 	var opener amqpConn
@@ -220,19 +233,26 @@ type amqpRoute struct {
 	routingKey string
 }
 
-// amqpBroker 发布与消费各用一条 Channel，避免 amqp091 跨 goroutine 共用。
-// Publish 在 mu 内串行；Consume 只发生在 Claim 路径。
+// amqpPubSlot 一条发布 Channel。amqp091 Channel 不能跨 goroutine，槽内串行。
+type amqpPubSlot struct {
+	mu sync.Mutex
+	ch AMQPChannel
+}
+
+// amqpBroker 发布用 Channel 池，消费单独一条，避免 amqp091 跨 goroutine 共用。
 type amqpBroker struct {
 	conn    amqpConn
 	mu      sync.Mutex
-	stopped bool
-	pub     AMQPChannel
+	stopped atomic.Bool
+	pubN    int
+	rr      uint32
+	pubs    []*amqpPubSlot
 	sub     AMQPChannel
 	msgCh   <-chan amqp.Delivery
 }
 
 func newAMQPBroker(conn amqpConn) *amqpBroker {
-	return &amqpBroker{conn: conn}
+	return &amqpBroker{conn: conn, pubN: defaultAMQPPublishChannels}
 }
 
 func (b *amqpBroker) openLocked() (AMQPChannel, error) {
@@ -262,11 +282,41 @@ func (b *amqpBroker) declareLocked(ch AMQPChannel, t *amqpTopology) error {
 	return ch.QueueBind(queue, t.routingKey, t.exchange, false, nil)
 }
 
-func (b *amqpBroker) ensurePubLocked(t *amqpTopology) error {
-	if b.stopped {
-		return ErrChannelClosed
+func (b *amqpBroker) checkout() (*amqpPubSlot, error) {
+	b.mu.Lock()
+	if b.stopped.Load() {
+		b.mu.Unlock()
+		return nil, ErrChannelClosed
 	}
-	if b.pub != nil {
+	if b.pubN < 1 {
+		b.pubN = defaultAMQPPublishChannels
+	}
+	for _, s := range b.pubs {
+		if s.mu.TryLock() {
+			b.mu.Unlock()
+			return s, nil
+		}
+	}
+	if len(b.pubs) < b.pubN {
+		s := &amqpPubSlot{}
+		s.mu.Lock()
+		b.pubs = append(b.pubs, s)
+		b.mu.Unlock()
+		return s, nil
+	}
+	s := b.pubs[int(b.rr)%len(b.pubs)]
+	b.rr++
+	b.mu.Unlock()
+	s.mu.Lock()
+	if b.stopped.Load() {
+		s.mu.Unlock()
+		return nil, ErrChannelClosed
+	}
+	return s, nil
+}
+
+func (b *amqpBroker) ensureSlot(s *amqpPubSlot, t *amqpTopology) error {
+	if s.ch != nil {
 		return nil
 	}
 	ch, err := b.openLocked()
@@ -277,12 +327,12 @@ func (b *amqpBroker) ensurePubLocked(t *amqpTopology) error {
 		_ = ch.Close()
 		return err
 	}
-	b.pub = ch
+	s.ch = ch
 	return nil
 }
 
 func (b *amqpBroker) ensureSubLocked(t *amqpTopology) error {
-	if b.stopped {
+	if b.stopped.Load() {
 		return ErrChannelClosed
 	}
 	if b.sub != nil {
@@ -304,13 +354,21 @@ func (b *amqpBroker) publish(ctx context.Context, t *amqpTopology, msg amqp.Publ
 	if b == nil {
 		return ErrPublishFailed
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if err := b.ensurePubLocked(t); err != nil {
+	slot, err := b.checkout()
+	if err != nil {
+		return err
+	}
+	defer slot.mu.Unlock()
+	if err := b.ensureSlot(slot, t); err != nil {
 		return err
 	}
 	route := t.route()
-	return b.pub.PublishWithContext(ctx, route.exchange, route.routingKey, false, false, msg)
+	exchange, key := route.exchange, route.routingKey
+	if d, ok := msg.Headers["x-delay"].(int64); ok && d <= 0 {
+		// 已到期不走延迟插件，走默认交换机按队列名直投。
+		exchange, key = "", t.consumeQueue()
+	}
+	return slot.ch.PublishWithContext(ctx, exchange, key, false, false, msg)
 }
 
 func (b *amqpBroker) source(t *amqpTopology) (amqpSource, error) {
@@ -348,17 +406,30 @@ func (b *amqpBroker) drop() {
 
 func (b *amqpBroker) shutdown() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.stopped = true
+	b.stopped.Store(true)
 	b.msgCh = nil
-	sub, pub := b.sub, b.pub
-	b.sub, b.pub = nil, nil
+	slots := b.pubs
+	b.pubs = nil
+	sub := b.sub
+	b.sub = nil
+	b.mu.Unlock()
+
 	var first error
-	if sub != nil {
-		first = sub.Close()
+	for _, s := range slots {
+		if s == nil {
+			continue
+		}
+		s.mu.Lock()
+		if s.ch != nil && s.ch != sub {
+			if err := s.ch.Close(); err != nil && first == nil {
+				first = err
+			}
+			s.ch = nil
+		}
+		s.mu.Unlock()
 	}
-	if pub != nil && pub != sub {
-		if err := pub.Close(); err != nil && first == nil {
+	if sub != nil {
+		if err := sub.Close(); err != nil && first == nil {
 			first = err
 		}
 	}
