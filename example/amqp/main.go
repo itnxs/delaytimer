@@ -16,7 +16,7 @@ import (
 func main() {
     url := os.Getenv("AMQP_URL")
     if url == "" {
-        url = "michong:michong@loong-dev-rabbitmq.rabbitmq.svc.cluster.local:5672/"
+        url = "amqp://michong:michong@loong-dev-rabbitmq.rabbitmq.svc.cluster.local:5672/"
     }
     conn, err := amqp.Dial(url)
     if err != nil {
