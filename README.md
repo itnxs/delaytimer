@@ -12,6 +12,8 @@ _ = t.DelEvent(params)
 
 完整可运行示例见 [`example/memory`](example/memory)、[`example/redis`](example/redis)、[`example/amqp`](example/amqp)。
 
+投递 / 消费吞吐测试见 [throughput.md](throughput.md)。
+
 `Start` 在内部起 goroutine；`Close` 会取消并等待退出。AMQP 后端还会关掉库打开的 Channel（连接仍由调用方 `Close`）。
 
 ## 投递与取消
