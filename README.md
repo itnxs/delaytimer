@@ -14,7 +14,7 @@ _ = t.DelEvent(params)
 
 投递 / 消费吞吐测试见 [throughput.md](throughput.md)。
 
-`Start` 在内部起 goroutine；`Close` 会取消并等待退出。AMQP 后端还会关掉库打开的 Channel（连接仍由调用方 `Close`）。
+`Start` 在内部起 goroutine；`Close` 会停止领取、把已拿到的任务处理完，再退出。AMQP 后端还会关掉库打开的 Channel（连接仍由调用方 `Close`）。
 
 ## 投递与取消
 
@@ -55,6 +55,8 @@ Handler 返回错误时：
 | `WithFailPolicy(FailRequeue)` | 约 200ms 后重新入队 |
 
 未知 Kind、JSON 解码失败：**始终抛弃**，不走 FailPolicy。
+
+`WithHandleTimeout` 限制单条 Handle 最长执行时间（默认不限制）。超时后取消传给 Handler 的 ctx，再按上表 FailPolicy 处理。Handler 需要响应 `ctx` 才会在超时后返回。
 
 ## Store
 
@@ -138,6 +140,7 @@ Redis Claim 用该 Key 还原 Kind / Payload。AMQP 消息体里同时带 Key、
 | `WithConcurrency` | 32 | 同时执行 Handle 的上限；领取与 Handle 重叠，不必等整批结束 |
 | `WithBatchSize` | 32 | 单次 Claim 条数 |
 | `WithPollInterval` | 200ms | Claim 无任务或失败后的等待。Redis 主要靠此项轮询 |
+| `WithHandleTimeout` | 不限制 | 单条 Handle 最长执行时间；超时后取消 Handler 的 ctx，再按 FailPolicy 处理。Handler 需响应 ctx |
 | `WithLogger` / `WithLogLevel` | stderr Info | 日志 |
 
 Bus 自身：`WithChannelSize`（默认 2000）、`WithTimeout`（默认 3s）。

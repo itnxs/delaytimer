@@ -1,6 +1,7 @@
 package delaytimer
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -117,6 +118,53 @@ func TestTimerSetEventUsesBusWhenConfigured(t *testing.T) {
 	if len(scheduled) != 0 || len(canceled) != 0 {
 		t.Fatalf("with bus, SetEvent/DelEvent must not write store directly: scheduled=%d canceled=%d", len(scheduled), len(canceled))
 	}
+}
+
+func TestWithBusCloseWaitsForPersist(t *testing.T) {
+	store := &slowCloseStore{delay: 40 * time.Millisecond}
+	bus := NewBus()
+	timer := New(store, WithBus(bus), WithLogger(silentLogger()))
+	if err := timer.SetEvent(time.Unix(1000, 0), &sampleParams{ID: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	timer.Close()
+	scheduled, _, _, _ := store.snapshot()
+	if len(scheduled) != 1 {
+		t.Fatalf("Close returned before bus persist, scheduled=%d", len(scheduled))
+	}
+	if !store.closedAfterSchedule() {
+		t.Fatal("store.Close ran before bus Schedule finished")
+	}
+}
+
+type slowCloseStore struct {
+	fakeStore
+	delay time.Duration
+	order []string
+}
+
+func (s *slowCloseStore) Schedule(ctx context.Context, task Task) error {
+	time.Sleep(s.delay)
+	s.mu.Lock()
+	s.order = append(s.order, "schedule")
+	s.mu.Unlock()
+	return s.fakeStore.Schedule(ctx, task)
+}
+
+func (s *slowCloseStore) Close() error {
+	s.mu.Lock()
+	s.order = append(s.order, "close")
+	s.mu.Unlock()
+	return s.fakeStore.Close()
+}
+
+func (s *slowCloseStore) closedAfterSchedule() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.order) < 2 {
+		return false
+	}
+	return s.order[0] == "schedule" && s.order[1] == "close"
 }
 
 func TestWithBusSetEventWritesStoreEventually(t *testing.T) {

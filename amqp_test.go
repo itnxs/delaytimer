@@ -531,7 +531,7 @@ func TestAMQPClaimClosedAfterPartial(t *testing.T) {
 	}
 }
 
-func TestAMQPAckFailRelease(t *testing.T) {
+func TestAMQPAckFail(t *testing.T) {
 	ack := &fakeAcknowledger{}
 	task := Task{ack: &amqpDeliveryAck{d: amqp.Delivery{Acknowledger: ack}}}
 	a := amqpStore(&fakeAMQPChannel{}, testAMQPConfig())
@@ -549,15 +549,6 @@ func TestAMQPAckFailRelease(t *testing.T) {
 	}
 	if !nack.nacked || !nack.requeue {
 		t.Fatalf("fail nack=%+v", nack)
-	}
-
-	rel := &fakeAcknowledger{}
-	task.ack = &amqpDeliveryAck{d: amqp.Delivery{Acknowledger: rel}}
-	if err := a.Release(context.Background(), task); err != nil {
-		t.Fatal(err)
-	}
-	if !rel.nacked || !rel.requeue {
-		t.Fatalf("release nack=%+v", rel)
 	}
 
 	if err := a.Ack(context.Background(), Task{}); err != nil {

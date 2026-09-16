@@ -173,11 +173,6 @@ func (a *AMQP) Fail(ctx context.Context, task Task) error {
 	return a.Schedule(ctx, task)
 }
 
-// Release 把未 Ack 消息重新入队。Claim 后已 Ack，调用为空操作。
-func (a *AMQP) Release(_ context.Context, task Task) error {
-	return confirmAMQP(task, func(h ack) error { return h.Nack(true) })
-}
-
 // Close 关闭内部打开的发布 / 消费 Channel。连接仍由调用方 Close。可重复调用。
 func (a *AMQP) Close() error {
 	if a == nil || a.broker == nil {

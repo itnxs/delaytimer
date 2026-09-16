@@ -7,6 +7,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/redis/go-redis/v9"
+	"github.com/spf13/cast"
 )
 
 var _ Store = (*Redis)(nil)
@@ -17,7 +18,7 @@ type redisZSet interface {
 	ZAdd(ctx context.Context, key string, members ...redis.Z) *redis.IntCmd
 	ZAddNX(ctx context.Context, key string, members ...redis.Z) *redis.IntCmd
 	ZRem(ctx context.Context, key string, members ...interface{}) *redis.IntCmd
-	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd
+	redis.Scripter
 }
 
 // redisClaimLua 一次领取到期 member：ZRANGEBYSCORE + ZREM。
@@ -44,6 +45,8 @@ end
 redis.call('ZREM', key, unpack(members))
 return items
 `
+
+var redisClaimScript = redis.NewScript(redisClaimLua)
 
 // Redis 单 ZSET 延迟任务。Claim 用一条 Lua 竞争领取，无到期任务时立即返回空，不阻塞。
 type Redis struct {
@@ -105,6 +108,7 @@ func (r *Redis) Cancel(ctx context.Context, key string) error {
 }
 
 // Claim 领取到期任务。一条 Lua 完成 ZRANGEBYSCORE + ZREM，无任务时立即返回空。
+// EVAL 不绑入参 ctx：关闭时服务端可能已删除 member，仍要把结果交回调用方排空。
 func (r *Redis) Claim(ctx context.Context, n int) ([]Task, error) {
 	if n < 1 {
 		n = 1
@@ -113,7 +117,7 @@ func (r *Redis) Claim(ctx context.Context, n int) ([]Task, error) {
 	if !r.useServerTime {
 		nowArg = strconv.FormatInt(r.clock().UnixMilli(), 10)
 	}
-	raw, err := r.cmd.Eval(ctx, redisClaimLua, []string{r.key}, nowArg, n).Result()
+	raw, err := redisClaimScript.Run(context.WithoutCancel(ctx), r.cmd, []string{r.key}, nowArg, n).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -130,11 +134,6 @@ func (r *Redis) Close() error { return nil }
 func (r *Redis) Fail(ctx context.Context, task Task) error {
 	at := float64(r.nowMilli(ctx) + failRequeueDelay.Milliseconds())
 	return r.put(ctx, task, at, true)
-}
-
-// Release 立即重新入队，供其他副本领取。同 Key 已被新 Schedule 覆盖则不改写。
-func (r *Redis) Release(ctx context.Context, task Task) error {
-	return r.put(ctx, task, float64(r.nowMilli(ctx)), true)
 }
 
 func (r *Redis) nowMilli(ctx context.Context) int64 {
@@ -179,41 +178,11 @@ func tasksFromClaimEval(raw any) ([]Task, error) {
 	if !ok {
 		return nil, errors.Errorf("redis claim: unexpected type %T", raw)
 	}
-	out := make([]Task, 0, len(arr)/2)
+	output := make([]Task, 0, len(arr)/2)
 	for i := 0; i+1 < len(arr); i += 2 {
-		member := redisEvalString(arr[i])
-		score := redisEvalInt64(arr[i+1])
-		out = append(out, redisMember(member).task(float64(score)))
+		member := cast.ToString(arr[i])
+		score := cast.ToInt64(arr[i+1])
+		output = append(output, redisMember(member).task(float64(score)))
 	}
-	return out, nil
-}
-
-func redisEvalString(v any) string {
-	switch x := v.(type) {
-	case string:
-		return x
-	case []byte:
-		return string(x)
-	default:
-		return ""
-	}
-}
-
-func redisEvalInt64(v any) int64 {
-	switch x := v.(type) {
-	case int64:
-		return x
-	case int:
-		return int64(x)
-	case float64:
-		return int64(x)
-	case string:
-		n, _ := strconv.ParseInt(x, 10, 64)
-		return n
-	case []byte:
-		n, _ := strconv.ParseInt(string(x), 10, 64)
-		return n
-	default:
-		return 0
-	}
+	return output, nil
 }

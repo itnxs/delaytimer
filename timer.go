@@ -34,8 +34,10 @@ type Timer struct {
 	cancel      context.CancelFunc
 	closed      bool
 	running     bool
-	done        sync.WaitGroup
-	failPolicy  FailPolicy
+	done          sync.WaitGroup
+	busDone       sync.WaitGroup
+	failPolicy    FailPolicy
+	handleTimeout time.Duration
 }
 
 // New 创建 Timer。store 不能为空，否则 panic。
@@ -66,30 +68,30 @@ func New(store Store, options ...Option) *Timer {
 	return t
 }
 
-// Start 后台领取到期任务并执行 Handler。ctx 取消或 Close 后退出。
-// Close 会取消并等待循环结束。重复调用返回 ErrAlreadyRunning。
+// Start 后台领取到期任务并执行 Handler。ctx 取消或 Close 后停止领取；
+// 已领取且进入管道的任务会继续处理完。重复调用返回 ErrAlreadyRunning。
 func (t *Timer) Start(ctx context.Context) error {
 	ctx, err := t.begin(ctx)
 	if err != nil {
 		return err
 	}
-	t.done.Add(1)
 	go func() {
 		defer t.done.Done()
 		defer t.stop()
-		_ = t.loop(ctx)
+		t.loop(ctx)
 	}()
 	return nil
 }
 
-// Close 停止 Start：取消并等待循环退出，然后关闭 Store（AMQP 会关掉内部 Channel）。
-// 若启用了 Bus 则关闭其通道。可重复调用。关闭后 SetEvent / DelEvent 返回 ErrChannelClosed。
+// Close 停止领取：唤醒等待中的 Claim，把已拿到的任务处理完，再关闭 Store。
+// 若启用了 Bus 则先排空并等待订阅结束。可重复调用。关闭后 SetEvent / DelEvent 返回 ErrChannelClosed。
 func (t *Timer) Close() {
 	if t == nil {
 		return
 	}
 	t.stop()
 	t.done.Wait()
+	t.busDone.Wait()
 	if t.store != nil {
 		if err := t.store.Close(); err != nil {
 			t.logger.WithError(err).Error("store close failed")
@@ -204,6 +206,7 @@ func (t *Timer) begin(parent context.Context) (context.Context, error) {
 	}
 	t.running = true
 	t.cancel = cancel
+	t.done.Add(1)
 	return ctx, nil
 }
 
@@ -237,7 +240,8 @@ func (t *Timer) bindHandlers() {
 }
 
 // loop 领取任务并交给 RxGo 并发 Handle。发送阻塞形成背压，在途约等于 concurrency。
-func (t *Timer) loop(ctx context.Context) error {
+func (t *Timer) loop(ctx context.Context) {
+	workCtx := context.WithoutCancel(ctx)
 	ch := make(chan rxgo.Item)
 	go func() {
 		defer close(ch)
@@ -250,7 +254,7 @@ func (t *Timer) loop(ctx context.Context) error {
 				if !ok {
 					return i, nil
 				}
-				if err := t.dispatch(ctx, task); err != nil {
+				if err := t.dispatch(workCtx, task); err != nil {
 					fields := logrus.Fields{
 						"kind": task.Kind,
 						"key":  task.Key,
@@ -270,7 +274,6 @@ func (t *Timer) loop(ctx context.Context) error {
 		ForEach(func(interface{}) {}, func(err error) {
 			t.logger.WithError(err).Error("consume stream failed")
 		}, func() {})
-	return ctx.Err()
 }
 
 func (t *Timer) produceClaims(ctx context.Context, next chan<- rxgo.Item) {
@@ -279,20 +282,19 @@ func (t *Timer) produceClaims(ctx context.Context, next chan<- rxgo.Item) {
 			return
 		}
 		tasks, err := t.store.Claim(ctx, t.batchSize)
-		if err != nil {
-			if ctx.Err() != nil {
+		for i := range tasks {
+			if !rxgo.Of(tasks[i]).SendContext(context.Background(), next) {
 				return
 			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
 			t.logger.WithError(err).Error("claim failed")
 		}
 		if err != nil || len(tasks) == 0 {
 			if !t.sleep(ctx) {
-				return
-			}
-			continue
-		}
-		for i := range tasks {
-			if !rxgo.Of(tasks[i]).SendContext(ctx, next) {
 				return
 			}
 		}
@@ -339,11 +341,23 @@ func (t *Timer) dispatch(ctx context.Context, task Task) (err error) {
 		"at":   task.At,
 	}).Info("handle task")
 
-	if err := h.Handle(ctx, inst); err != nil {
+	handleCtx, cancel := t.handleContext(ctx)
+	if cancel != nil {
+		defer cancel()
+	}
+
+	if err := h.Handle(handleCtx, inst); err != nil {
 		return t.handleFail(ctx, task, err)
 	}
 
 	return nil
+}
+
+func (t *Timer) handleContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if t.handleTimeout <= 0 {
+		return ctx, nil
+	}
+	return context.WithTimeout(ctx, t.handleTimeout)
 }
 
 // handleFail 仅处理 Handler 返回的错误。

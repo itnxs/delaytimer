@@ -1,6 +1,6 @@
 module github.com/itnxs/delaytimer
 
-go 1.26.3
+go 1.25.4
 
 require (
 	github.com/json-iterator/go v1.1.12
@@ -9,7 +9,7 @@ require (
 	github.com/reactivex/rxgo/v2 v2.5.0
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/sirupsen/logrus v1.10.2
-	golang.org/x/sync v0.23.0
+	github.com/spf13/cast v1.10.0
 )
 
 require (

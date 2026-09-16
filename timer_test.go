@@ -485,3 +485,151 @@ func TestTimerCloseWaitsForAsyncDispatch(t *testing.T) {
 		t.Fatal("Close returned before handler finished")
 	}
 }
+
+// claimAfterCancelStore 模拟 Redis：EVAL 在 ctx 取消后仍返回已 ZREM 的任务。
+type claimAfterCancelStore struct {
+	fakeStore
+	entered chan struct{}
+}
+
+func (s *claimAfterCancelStore) Claim(ctx context.Context, n int) ([]Task, error) {
+	s.mu.Lock()
+	s.claimCalls++
+	s.mu.Unlock()
+	select {
+	case <-s.entered:
+	default:
+		close(s.entered)
+	}
+	<-ctx.Done()
+	return s.fakeStore.Claim(context.Background(), n)
+}
+
+func TestTimerCloseDrainsClaimedTasks(t *testing.T) {
+	store := &claimAfterCancelStore{
+		fakeStore: fakeStore{claims: []Task{sampleTaskAt(time.Unix(1, 0))}},
+		entered:   make(chan struct{}),
+	}
+	handled := make(chan struct{}, 1)
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
+		handled <- struct{}{}
+		return nil
+	})
+	timer := New(store, WithHandlers(h), WithLogger(silentLogger()), WithPollInterval(time.Millisecond), WithConcurrency(1), WithBatchSize(1))
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-store.entered
+	timer.Close()
+	select {
+	case <-handled:
+	default:
+		t.Fatal("Close dropped a task that Claim already returned")
+	}
+}
+
+func TestTimerCloseFailRequeueIgnoresCancel(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	store := &failIfCanceledStore{fakeStore: fakeStore{claims: []Task{sampleTaskAt(time.Unix(1, 0))}}}
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
+		close(started)
+		<-release
+		return errors.New("boom")
+	})
+	timer := New(store, WithHandlers(h), WithFailPolicy(FailRequeue), WithLogger(silentLogger()), WithPollInterval(time.Millisecond), WithConcurrency(1), WithBatchSize(1))
+	if err := timer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	done := make(chan struct{})
+	go func() {
+		timer.Close()
+		close(done)
+	}()
+	time.Sleep(30 * time.Millisecond)
+	close(release)
+	<-done
+	_, _, _, failN := store.snapshot()
+	if store.canceledFail > 0 {
+		t.Fatalf("Fail saw canceled ctx %d times", store.canceledFail)
+	}
+	if failN != 1 {
+		t.Fatalf("fail=%d want 1", failN)
+	}
+}
+
+type failIfCanceledStore struct {
+	fakeStore
+	canceledFail int
+}
+
+func (s *failIfCanceledStore) Fail(ctx context.Context, task Task) error {
+	if ctx.Err() != nil {
+		s.mu.Lock()
+		s.canceledFail++
+		s.mu.Unlock()
+		return ctx.Err()
+	}
+	return s.fakeStore.Fail(ctx, task)
+}
+
+func TestDispatchHandleTimeoutDiscard(t *testing.T) {
+	store := &fakeStore{}
+	timedOut := make(chan struct{}, 1)
+	h := Bind(&sampleParams{}, func(ctx context.Context, _ *sampleParams) error {
+		<-ctx.Done()
+		timedOut <- struct{}{}
+		return ctx.Err()
+	})
+	timer := New(store, WithHandlers(h), WithHandleTimeout(20*time.Millisecond), WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	err := timer.dispatch(context.Background(), sampleTaskAt(time.Unix(1, 0)))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v", err)
+	}
+	select {
+	case <-timedOut:
+	default:
+		t.Fatal("handler should see timeout")
+	}
+	_, _, _, failN := store.snapshot()
+	if failN != 0 {
+		t.Fatalf("FailDiscard failN=%d", failN)
+	}
+}
+
+func TestDispatchHandleTimeoutRequeue(t *testing.T) {
+	store := &failIfCanceledStore{}
+	h := Bind(&sampleParams{}, func(ctx context.Context, _ *sampleParams) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	timer := New(store, WithHandlers(h), WithHandleTimeout(20*time.Millisecond), WithFailPolicy(FailRequeue), WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	err := timer.dispatch(context.Background(), sampleTaskAt(time.Unix(1, 0)))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v", err)
+	}
+	if store.canceledFail > 0 {
+		t.Fatal("Fail must not use the timed-out handle ctx")
+	}
+	_, _, _, failN := store.snapshot()
+	if failN != 1 {
+		t.Fatalf("fail=%d want 1", failN)
+	}
+}
+
+func TestDispatchHandleTimeoutNotFired(t *testing.T) {
+	store := &fakeStore{}
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error { return nil })
+	timer := New(store, WithHandlers(h), WithHandleTimeout(time.Second), WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	if err := timer.dispatch(context.Background(), sampleTaskAt(time.Unix(1, 0))); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, failN := store.snapshot()
+	if failN != 0 {
+		t.Fatalf("fail=%d", failN)
+	}
+}

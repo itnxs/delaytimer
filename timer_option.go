@@ -96,3 +96,13 @@ func WithPollInterval(duration time.Duration) Option {
 		}
 	}
 }
+
+// WithHandleTimeout 单条 Handle 最长执行时间。超时后取消传给 Handler 的 ctx，
+// 再按 FailPolicy 抛弃或重入队。默认 0 表示不限制。Handler 需响应 ctx 才会停。
+func WithHandleTimeout(d time.Duration) Option {
+	return func(t *Timer) {
+		if d > 0 {
+			t.handleTimeout = d
+		}
+	}
+}
