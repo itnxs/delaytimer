@@ -342,10 +342,9 @@ func TestAMQPReopensChannelAfterConsumeClosed(t *testing.T) {
 
 func TestAMQPSchedulePublishesToRoutingKey(t *testing.T) {
 	ch := &fakeAMQPChannel{}
-	now := time.UnixMilli(1_700_000_000_000)
-	a := amqpStore(ch, testAMQPConfig(), WithAMQPClock(func() time.Time { return now }))
+	a := amqpStore(ch, testAMQPConfig())
 
-	task := Task{Key: "order:1", Kind: "order", Payload: `{"id":1}`, At: now.Add(5 * time.Second)}
+	task := Task{Key: "order:1", Kind: "order", Payload: `{"id":1}`, At: time.Now().Add(5 * time.Second)}
 	if err := a.Schedule(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}
@@ -357,11 +356,11 @@ func TestAMQPSchedulePublishesToRoutingKey(t *testing.T) {
 		t.Fatalf("route=%s/%s", rec.exchange, rec.key)
 	}
 	delay, _ := rec.msg.Headers["x-delay"].(int64)
-	if delay != 5000 {
+	if delay <= 0 || delay > 5000 {
 		t.Fatalf("x-delay=%v", rec.msg.Headers["x-delay"])
 	}
 
-	past := Task{Key: "order:2", Kind: "order", Payload: "{}", At: now.Add(-time.Second)}
+	past := Task{Key: "order:2", Kind: "order", Payload: "{}", At: time.Now().Add(-time.Second)}
 	if err := a.Schedule(context.Background(), past); err != nil {
 		t.Fatal(err)
 	}
@@ -564,8 +563,7 @@ func TestAMQPFailRepublishesAfterClaimAck(t *testing.T) {
 		Body:         []byte(`{"key":"order:1","kind":"order","payload":"{}","at":1}`),
 	}
 	ch := &fakeAMQPChannel{deliveries: deliveries}
-	now := time.UnixMilli(1_700_000_000_000)
-	a := amqpStore(ch, testAMQPConfig(), WithAMQPClock(func() time.Time { return now }))
+	a := amqpStore(ch, testAMQPConfig())
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -590,7 +588,7 @@ func TestAMQPFailRepublishesAfterClaimAck(t *testing.T) {
 		t.Fatalf("fail should republish, pubs=%d", len(ch.pubs))
 	}
 	delay, _ := ch.pubs[0].msg.Headers["x-delay"].(int64)
-	if delay != failRequeueDelay.Milliseconds() {
+	if delay <= 0 || delay > failRequeueDelay.Milliseconds() {
 		t.Fatalf("x-delay=%v", ch.pubs[0].msg.Headers["x-delay"])
 	}
 }

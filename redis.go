@@ -10,29 +10,28 @@ import (
 	"github.com/spf13/cast"
 )
 
-var _ Store = (*Redis)(nil)
+var (
+	_ Store                  = (*Redis)(nil)
+	_ redis.SortedSetCmdable = (*redis.Client)(nil)
+	_ redis.SortedSetCmdable = (*redis.ClusterClient)(nil)
+	_ redis.Scripter         = (*redis.Client)(nil)
+	_ redis.Scripter         = (*redis.ClusterClient)(nil)
+)
 
-// redisZSet 单个有序集合所需命令，*redis.Client / ClusterClient 已满足。
-type redisZSet interface {
-	Time(ctx context.Context) *redis.TimeCmd
-	ZAdd(ctx context.Context, key string, members ...redis.Z) *redis.IntCmd
-	ZAddNX(ctx context.Context, key string, members ...redis.Z) *redis.IntCmd
-	ZRem(ctx context.Context, key string, members ...interface{}) *redis.IntCmd
+// redisStore SortedSet 写入 + Lua Claim。*redis.Client / ClusterClient 已满足。
+type redisStore interface {
+	redis.SortedSetCmdable
 	redis.Scripter
 }
 
 // redisClaimLua 一次领取到期 member：ZRANGEBYSCORE + ZREM。
-// ARGV[1] 为毫秒时间；空字符串则用 Redis TIME。ARGV[2] 为条数。
+// ARGV[1] 为进程毫秒时间。ARGV[2] 为条数。
 const redisClaimLua = `
 local key = KEYS[1]
-local now = ARGV[1]
+local now = tonumber(ARGV[1])
 local n = tonumber(ARGV[2])
 if n == nil or n < 1 then
   n = 1
-end
-if now == false or now == nil or now == '' then
-  local t = redis.call('TIME')
-  now = tostring(tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000))
 end
 local items = redis.call('ZRANGEBYSCORE', key, '-inf', now, 'WITHSCORES', 'LIMIT', 0, n)
 if #items == 0 then
@@ -50,51 +49,27 @@ var redisClaimScript = redis.NewScript(redisClaimLua)
 
 // Redis 单 ZSET 延迟任务。Claim 用一条 Lua 竞争领取，无到期任务时立即返回空，不阻塞。
 type Redis struct {
-	cmd           redisZSet
-	key           string
-	clock         Clock
-	useServerTime bool
-}
-
-// RedisOption Redis 选项
-type RedisOption func(*Redis)
-
-// WithRedisClock 注入时钟；同时关闭 Redis TIME，便于单测。
-func WithRedisClock(c Clock) RedisOption {
-	return func(r *Redis) {
-		if c != nil {
-			r.clock = c
-			r.useServerTime = false
-		}
-	}
+	cmd redisStore
+	key string
 }
 
 // NewRedis 使用 go-redis Cmdable。cmd 一般为 *redis.Client / ClusterClient，key 为 ZSET 名。
 // cmd 为空或 key 为空时 panic。
-func NewRedis(cmd redis.Cmdable, key string, opts ...RedisOption) *Redis {
+func NewRedis(cmd redis.Cmdable, key string) *Redis {
 	if cmd == nil {
 		panic(ErrNilRedis)
 	}
-	return newRedis(cmd, key, opts...)
+	return newRedis(cmd, key)
 }
 
-func newRedis(cmd redisZSet, key string, opts ...RedisOption) *Redis {
+func newRedis(cmd redisStore, key string) *Redis {
 	if cmd == nil {
 		panic(ErrNilRedis)
 	}
 	if key == "" {
 		panic(ErrEmptyRedisKey)
 	}
-	r := &Redis{
-		cmd:           cmd,
-		key:           key,
-		clock:         time.Now,
-		useServerTime: true,
-	}
-	for _, opt := range opts {
-		opt(r)
-	}
-	return r
+	return &Redis{cmd: cmd, key: key}
 }
 
 // Schedule 写入或按 member 覆盖到期时间
@@ -113,10 +88,7 @@ func (r *Redis) Claim(ctx context.Context, n int) ([]Task, error) {
 	if n < 1 {
 		n = 1
 	}
-	var nowArg interface{} = ""
-	if !r.useServerTime {
-		nowArg = strconv.FormatInt(r.clock().UnixMilli(), 10)
-	}
+	nowArg := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	raw, err := redisClaimScript.Run(context.WithoutCancel(ctx), r.cmd, []string{r.key}, nowArg, n).Result()
 	if err != nil {
 		return nil, err
@@ -132,17 +104,8 @@ func (r *Redis) Close() error { return nil }
 
 // Fail 重新入队；若同 member 已被新 Schedule 覆盖则不改写
 func (r *Redis) Fail(ctx context.Context, task Task) error {
-	at := float64(r.nowMilli(ctx) + failRequeueDelay.Milliseconds())
+	at := float64(time.Now().UnixMilli() + failRequeueDelay.Milliseconds())
 	return r.put(ctx, task, at, true)
-}
-
-func (r *Redis) nowMilli(ctx context.Context) int64 {
-	if r.useServerTime {
-		if tm, err := r.cmd.Time(ctx).Result(); err == nil {
-			return tm.UnixMilli()
-		}
-	}
-	return r.clock().UnixMilli()
 }
 
 func (r *Redis) put(ctx context.Context, task Task, score float64, nx bool) error {

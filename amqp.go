@@ -37,22 +37,12 @@ type AMQPConfig struct {
 // Claim 成功解码后立刻 Ack，避免 unack 堵住消费。
 // Close 关闭内部打开的发布 / 消费 Channel；连接仍由调用方关闭。
 type AMQP struct {
-	clock    Clock
 	topology *amqpTopology
 	broker   *amqpBroker
 }
 
 // AMQPOption AMQP 选项
 type AMQPOption func(*AMQP)
-
-// WithAMQPClock 注入时钟
-func WithAMQPClock(c Clock) AMQPOption {
-	return func(a *AMQP) {
-		if c != nil {
-			a.clock = c
-		}
-	}
-}
 
 const defaultAMQPPublishChannels = 8
 
@@ -95,7 +85,6 @@ func NewAMQP(conn *amqp.Connection, cfg AMQPConfig, options ...AMQPOption) *AMQP
 
 func newAMQP(conn amqpConn, cfg AMQPConfig, options ...AMQPOption) *AMQP {
 	a := &AMQP{
-		clock:    time.Now,
 		topology: newAMQPTopology(cfg),
 		broker:   newAMQPBroker(conn),
 	}
@@ -107,7 +96,7 @@ func newAMQP(conn amqpConn, cfg AMQPConfig, options ...AMQPOption) *AMQP {
 
 // Schedule 发布延迟消息（header x-delay 毫秒）
 func (a *AMQP) Schedule(ctx context.Context, task Task) error {
-	cmd := newAMQPPublish(task, a.clock())
+	cmd := newAMQPPublish(task, time.Now())
 	msg, err := cmd.publishing()
 	if err != nil {
 		return err
@@ -169,7 +158,7 @@ func (a *AMQP) Fail(ctx context.Context, task Task) error {
 	if task.ack != nil {
 		return confirmAMQP(task, func(h ack) error { return h.Nack(true) })
 	}
-	task.At = a.clock().Add(failRequeueDelay)
+	task.At = time.Now().Add(failRequeueDelay)
 	return a.Schedule(ctx, task)
 }
 

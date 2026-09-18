@@ -2,9 +2,9 @@ package delaytimer
 
 import (
 	"context"
-	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,26 +13,17 @@ import (
 )
 
 type memZSet struct {
-	mu    sync.Mutex
-	key   string
-	items map[string]int64
-	now   time.Time
-	evalN int
-	zremN int
-	timeN int
+	redis.SortedSetCmdable
+	mu         sync.Mutex
+	key        string
+	items      map[string]int64
+	evalN      int
+	zremN      int
+	lastNowArg string
 }
 
-func newMemZSet(key string, now time.Time) *memZSet {
-	return &memZSet{key: key, items: make(map[string]int64), now: now}
-}
-
-func (s *memZSet) Time(ctx context.Context) *redis.TimeCmd {
-	cmd := redis.NewTimeCmd(ctx, "time")
-	s.mu.Lock()
-	s.timeN++
-	cmd.SetVal(s.now)
-	s.mu.Unlock()
-	return cmd
+func newMemZSet(key string) *memZSet {
+	return &memZSet{key: key, items: make(map[string]int64)}
 }
 
 func (s *memZSet) ZAdd(ctx context.Context, key string, members ...redis.Z) *redis.IntCmd {
@@ -100,24 +91,17 @@ func (s *memZSet) Eval(ctx context.Context, _ string, keys []string, args ...int
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.evalN++
+	if len(args) > 0 {
+		s.lastNowArg, _ = args[0].(string)
+	}
 	if len(keys) != 1 || keys[0] != s.key {
 		cmd.SetVal([]any{})
 		return cmd
 	}
-	nowMilli := s.now.UnixMilli()
-	if len(args) > 0 {
-		switch x := args[0].(type) {
-		case string:
-			if x != "" {
-				if n, err := strconv.ParseInt(x, 10, 64); err == nil {
-					nowMilli = n
-				}
-			}
-		case int64:
-			nowMilli = x
-		case int:
-			nowMilli = int64(x)
-		}
+	nowMilli, err := strconv.ParseInt(s.lastNowArg, 10, 64)
+	if err != nil {
+		cmd.SetVal([]any{})
+		return cmd
 	}
 	n := 1
 	if len(args) > 1 {
@@ -193,9 +177,9 @@ func (s *memZSet) claimDueLocked(nowMilli int64, n int) []any {
 	return out
 }
 
-func testRedis(now time.Time) (*Redis, *memZSet) {
-	z := newMemZSet("jobs", now)
-	r := newRedis(z, "jobs", WithRedisClock(func() time.Time { return now }))
+func testRedis() (*Redis, *memZSet) {
+	z := newMemZSet("jobs")
+	r := newRedis(z, "jobs")
 	return r, z
 }
 
@@ -205,13 +189,13 @@ func TestRedisNewPanics(t *testing.T) {
 
 func TestRedisEmptyKeyPanics(t *testing.T) {
 	expectPanicIs(t, ErrEmptyRedisKey, func() {
-		newRedis(newMemZSet("jobs", time.Now()), "")
+		newRedis(newMemZSet("jobs"), "")
 	})
 }
 
 func TestRedisScheduleCancelClaim(t *testing.T) {
-	now := time.UnixMilli(1_700_000_000_000)
-	r, z := testRedis(now)
+	now := time.Now()
+	r, z := testRedis()
 	ctx := context.Background()
 	k1 := encodeTaskKey("order", "p1")
 	k2 := encodeTaskKey("order", "p2")
@@ -258,11 +242,10 @@ func TestRedisScheduleCancelClaim(t *testing.T) {
 }
 
 func TestRedisClaimCompetitive(t *testing.T) {
-	now := time.UnixMilli(1_700_000_000_000)
-	z := newMemZSet("jobs", now)
-	clock := func() time.Time { return now }
-	r1 := newRedis(z, "jobs", WithRedisClock(clock))
-	r2 := newRedis(z, "jobs", WithRedisClock(clock))
+	now := time.Now()
+	z := newMemZSet("jobs")
+	r1 := newRedis(z, "jobs")
+	r2 := newRedis(z, "jobs")
 	ctx := context.Background()
 	if err := r1.Schedule(ctx, Task{Key: encodeTaskKey("order", "p1"), Kind: "order", Payload: "p1", At: now.Add(-time.Second)}); err != nil {
 		t.Fatal(err)
@@ -293,8 +276,8 @@ func TestRedisClaimCompetitive(t *testing.T) {
 }
 
 func TestRedisFail(t *testing.T) {
-	now := time.UnixMilli(1_700_000_000_000)
-	r, z := testRedis(now)
+	now := time.Now()
+	r, z := testRedis()
 	ctx := context.Background()
 	task := Task{Key: encodeTaskKey("order", "p1"), Kind: "order", Payload: "p1", At: now.Add(-time.Second)}
 	if err := r.Schedule(ctx, task); err != nil {
@@ -304,14 +287,18 @@ func TestRedisFail(t *testing.T) {
 	if err != nil || len(got) != 1 {
 		t.Fatalf("claim=%v err=%v", got, err)
 	}
+	before := time.Now()
 	if err := r.Fail(ctx, got[0]); err != nil {
 		t.Fatal(err)
 	}
+	after := time.Now()
 	z.mu.Lock()
 	failAt := z.items[encodeTaskKey("order", "p1")]
 	z.mu.Unlock()
-	if failAt != now.UnixMilli()+failRequeueDelay.Milliseconds() {
-		t.Fatalf("fail score=%d", failAt)
+	wantMin := before.UnixMilli() + failRequeueDelay.Milliseconds()
+	wantMax := after.UnixMilli() + failRequeueDelay.Milliseconds()
+	if failAt < wantMin || failAt > wantMax {
+		t.Fatalf("fail score=%d want [%d, %d]", failAt, wantMin, wantMax)
 	}
 	empty, err := r.Claim(ctx, 1)
 	if err != nil || len(empty) != 0 {
@@ -338,8 +325,8 @@ func TestRedisFail(t *testing.T) {
 }
 
 func TestRedisClaimMinN(t *testing.T) {
-	now := time.UnixMilli(1_700_000_000_000)
-	r, _ := testRedis(now)
+	now := time.Now()
+	r, _ := testRedis()
 	ctx := context.Background()
 	if err := r.Schedule(ctx, Task{Key: encodeTaskKey("order", "p1"), Kind: "order", Payload: "p1", At: now.Add(-time.Second)}); err != nil {
 		t.Fatal(err)
@@ -351,8 +338,8 @@ func TestRedisClaimMinN(t *testing.T) {
 }
 
 func TestRedisClaimRestoresKindContainingColon(t *testing.T) {
-	now := time.UnixMilli(1_700_000_000_000)
-	r, _ := testRedis(now)
+	now := time.Now()
+	r, _ := testRedis()
 	ctx := context.Background()
 	kind := "order:timeout"
 	payload := `{"id":"1","a":"b"}`
@@ -370,8 +357,8 @@ func TestRedisClaimRestoresKindContainingColon(t *testing.T) {
 }
 
 func TestRedisClaimUsesSingleEval(t *testing.T) {
-	now := time.UnixMilli(1_700_000_000_000)
-	r, z := testRedis(now)
+	now := time.Now()
+	r, z := testRedis()
 	ctx := context.Background()
 	for _, p := range []string{"a", "b", "c"} {
 		if err := r.Schedule(ctx, Task{Key: encodeTaskKey("order", p), Kind: "order", Payload: p, At: now.Add(-time.Second)}); err != nil {
@@ -379,7 +366,7 @@ func TestRedisClaimUsesSingleEval(t *testing.T) {
 		}
 	}
 	z.mu.Lock()
-	z.evalN, z.zremN, z.timeN = 0, 0, 0
+	z.evalN, z.zremN = 0, 0
 	z.mu.Unlock()
 	got, err := r.Claim(ctx, 8)
 	if err != nil {
@@ -399,41 +386,44 @@ func TestRedisClaimUsesSingleEval(t *testing.T) {
 	}
 }
 
-func TestRedisClaimEvalUsesServerTime(t *testing.T) {
-	now := time.UnixMilli(1_700_000_000_000)
-	z := newMemZSet("jobs", now)
+func TestRedisClaimPassesProcessTime(t *testing.T) {
+	now := time.Now()
+	z := newMemZSet("jobs")
 	r := newRedis(z, "jobs")
 	ctx := context.Background()
 	if err := r.Schedule(ctx, Task{Key: encodeTaskKey("order", "p1"), Kind: "order", Payload: "p1", At: now.Add(-time.Second)}); err != nil {
 		t.Fatal(err)
 	}
-	z.mu.Lock()
-	z.evalN, z.timeN, z.zremN = 0, 0, 0
-	z.mu.Unlock()
+	before := time.Now()
 	got, err := r.Claim(ctx, 1)
+	after := time.Now()
 	if err != nil || len(got) != 1 {
 		t.Fatalf("got=%v err=%v", got, err)
 	}
 	z.mu.Lock()
-	evalN, timeN := z.evalN, z.timeN
+	evalN, nowArg := z.evalN, z.lastNowArg
 	z.mu.Unlock()
 	if evalN != 1 {
 		t.Fatalf("eval=%d", evalN)
 	}
-	if timeN != 0 {
-		t.Fatalf("TIME should run inside EVAL, timeN=%d", timeN)
+	gotNow, err := strconv.ParseInt(nowArg, 10, 64)
+	if err != nil {
+		t.Fatalf("ARGV now %q: %v", nowArg, err)
+	}
+	if gotNow < before.UnixMilli() || gotNow > after.UnixMilli() {
+		t.Fatalf("ARGV now=%d want [%d, %d]", gotNow, before.UnixMilli(), after.UnixMilli())
 	}
 }
 
 func TestRedisConcurrentClaimNoDuplicate(t *testing.T) {
-	now := time.UnixMilli(1_700_000_000_000)
-	r, _ := testRedis(now)
+	now := time.Now()
+	r, _ := testRedis()
 	assertConcurrentClaimNoDuplicate(t, r, 200, 16, now.Add(-time.Second))
 }
 
 func TestRedisConcurrentCancelAndClaim(t *testing.T) {
-	now := time.UnixMilli(1_700_000_000_000)
-	r, z := testRedis(now)
+	now := time.Now()
+	r, z := testRedis()
 	assertConcurrentCancelAndClaim(t, r, 300, now.Add(-time.Second), func() int64 {
 		z.mu.Lock()
 		defer z.mu.Unlock()
@@ -441,47 +431,10 @@ func TestRedisConcurrentCancelAndClaim(t *testing.T) {
 	})
 }
 
-func TestRedisLiveConcurrentClaimNoDuplicate(t *testing.T) {
-	rdb, store, zkey := liveRedisStore(t)
-	assertConcurrentClaimNoDuplicate(t, store, 200, 16, time.Now().Add(-time.Second))
-	leftover, err := rdb.ZCard(context.Background(), zkey).Result()
-	if err != nil {
-		t.Fatal(err)
+func TestRedisClaimLuaOmitsTIME(t *testing.T) {
+	if strings.Contains(strings.ToUpper(redisClaimLua), "TIME") {
+		t.Fatal("claim lua must not call TIME; some redis proxies reject it")
 	}
-	if leftover != 0 {
-		t.Fatalf("zcard=%d want 0", leftover)
-	}
-}
-
-func TestRedisLiveConcurrentCancelAndClaim(t *testing.T) {
-	rdb, store, zkey := liveRedisStore(t)
-	assertConcurrentCancelAndClaim(t, store, 300, time.Now().Add(-time.Second), func() int64 {
-		n, err := rdb.ZCard(context.Background(), zkey).Result()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return n
-	})
-}
-
-func liveRedisStore(t *testing.T) (*redis.Client, *Redis, string) {
-	t.Helper()
-	addr := os.Getenv("REDIS_ADDR")
-	if addr == "" {
-		addr = "127.0.0.1:6379"
-	}
-	rdb := redis.NewClient(&redis.Options{Addr: addr})
-	ctx := context.Background()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		_ = rdb.Close()
-		t.Skip(err)
-	}
-	key := "delaytimer:conc:" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	t.Cleanup(func() {
-		_ = rdb.Del(context.Background(), key).Err()
-		_ = rdb.Close()
-	})
-	return rdb, NewRedis(rdb, key), key
 }
 
 func assertConcurrentClaimNoDuplicate(t *testing.T, store *Redis, n, workers int, at time.Time) {

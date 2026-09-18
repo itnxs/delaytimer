@@ -21,9 +21,6 @@ func decodeTaskKey(key string) (kind, payload string) {
 	return
 }
 
-// Clock 当前时间，测试可注入
-type Clock func() time.Time
-
 type (
 	// Store 任务存储
 	Store interface {

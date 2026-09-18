@@ -7,7 +7,7 @@ import (
     "log"
     "time"
 
-    "github.com/itnxs/delaytimer"
+    "gitlab.haochang.tv/gopkg/delaytimer"
 )
 
 func main() {

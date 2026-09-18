@@ -1,6 +1,6 @@
 package main
 
-import "github.com/itnxs/delaytimer"
+import "gitlab.haochang.tv/gopkg/delaytimer"
 
 // OrderTimeout 示例到期参数。
 type OrderTimeout struct {

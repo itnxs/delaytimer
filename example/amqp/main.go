@@ -9,8 +9,8 @@ import (
     "os"
     "time"
 
-    "github.com/itnxs/delaytimer"
     amqp "github.com/rabbitmq/amqp091-go"
+    "gitlab.haochang.tv/gopkg/delaytimer"
 )
 
 func main() {

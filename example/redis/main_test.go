@@ -8,7 +8,7 @@ import (
     "testing"
     "time"
 
-    "github.com/itnxs/delaytimer"
+    "gitlab.haochang.tv/gopkg/delaytimer"
     "github.com/redis/go-redis/v9"
     "github.com/sirupsen/logrus"
 )

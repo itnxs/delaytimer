@@ -13,32 +13,12 @@ var _ Store = (*Memory)(nil)
 
 // Memory 进程内任务存储，不跨进程。无到期任务时 Claim 会阻塞。
 type Memory struct {
-	clock  Clock
 	agenda *memoryAgenda
 }
 
-// MemoryOption Memory 选项
-type MemoryOption func(*Memory)
-
-// WithMemoryClock 注入时钟，便于测试
-func WithMemoryClock(c Clock) MemoryOption {
-	return func(m *Memory) {
-		if c != nil {
-			m.clock = c
-		}
-	}
-}
-
 // NewMemory 新建内存后端
-func NewMemory(opts ...MemoryOption) *Memory {
-	m := &Memory{
-		clock:  time.Now,
-		agenda: newMemoryAgenda(),
-	}
-	for _, opt := range opts {
-		opt(m)
-	}
-	return m
+func NewMemory() *Memory {
+	return &Memory{agenda: newMemoryAgenda()}
 }
 
 // Schedule 设置或覆盖任务
@@ -58,7 +38,7 @@ func (m *Memory) Claim(ctx context.Context, n int) ([]Task, error) {
 	if n < 1 {
 		n = 1
 	}
-	return m.agenda.claim(ctx, n, m.clock)
+	return m.agenda.claim(ctx, n)
 }
 
 // Ack 内存后端在 Claim 时已移除任务
@@ -69,7 +49,7 @@ func (m *Memory) Close() error { return nil }
 
 // Fail 重新入队；若同 Key 已被新 Schedule 覆盖则不改写
 func (m *Memory) Fail(_ context.Context, task Task) error {
-	m.agenda.requeueUnlessPresent(task, m.clock().Add(failRequeueDelay))
+	m.agenda.requeueUnlessPresent(task, time.Now().Add(failRequeueDelay))
 	return nil
 }
 
@@ -127,7 +107,7 @@ func (a *memoryAgenda) requeueUnlessPresent(task Task, at time.Time) {
 	a.insertLocked(task)
 }
 
-func (a *memoryAgenda) claim(ctx context.Context, n int, clock Clock) ([]Task, error) {
+func (a *memoryAgenda) claim(ctx context.Context, n int) ([]Task, error) {
 	stop := a.watch(ctx)
 	defer stop()
 
@@ -138,7 +118,7 @@ func (a *memoryAgenda) claim(ctx context.Context, n int, clock Clock) ([]Task, e
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		now := clock()
+		now := time.Now()
 		if due := a.takeDue(now, n); len(due) > 0 {
 			return due, nil
 		}

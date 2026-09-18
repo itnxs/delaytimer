@@ -633,3 +633,149 @@ func TestDispatchHandleTimeoutNotFired(t *testing.T) {
 		t.Fatalf("fail=%d", failN)
 	}
 }
+
+func TestDispatchOnHandleError(t *testing.T) {
+	store := &fakeStore{}
+	cause := errors.New("boom")
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
+		return cause
+	})
+	var gotP Params
+	var gotErr error
+	called := 0
+	timer := New(store, WithHandlers(h), WithOnHandleError(func(_ context.Context, p Params, err error) {
+		called++
+		gotP = p
+		gotErr = err
+	}), WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	err := timer.dispatch(context.Background(), sampleTaskAt(time.Unix(1, 0)))
+	if !errors.Is(err, cause) {
+		t.Fatalf("err=%v", err)
+	}
+	if called != 1 {
+		t.Fatalf("called=%d", called)
+	}
+	sp, ok := gotP.(*sampleParams)
+	if !ok || sp.ID != "1" {
+		t.Fatalf("params=%v", gotP)
+	}
+	if !errors.Is(gotErr, cause) {
+		t.Fatalf("gotErr=%v", gotErr)
+	}
+	_, _, _, failN := store.snapshot()
+	if failN != 0 {
+		t.Fatalf("FailDiscard failN=%d", failN)
+	}
+}
+
+func TestDispatchOnHandleErrorNotCalledOnSuccess(t *testing.T) {
+	store := &fakeStore{}
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error { return nil })
+	called := 0
+	timer := New(store, WithHandlers(h), WithOnHandleError(func(context.Context, Params, error) {
+		called++
+	}), WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	if err := timer.dispatch(context.Background(), sampleTaskAt(time.Unix(1, 0))); err != nil {
+		t.Fatal(err)
+	}
+	if called != 0 {
+		t.Fatalf("called=%d", called)
+	}
+}
+
+func TestDispatchOnHandleErrorSkipsUnknownKindAndBadPayload(t *testing.T) {
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
+		t.Fatal("handler should not run")
+		return nil
+	})
+	called := 0
+	store := &fakeStore{}
+	timer := New(store, WithHandlers(h), WithOnHandleError(func(context.Context, Params, error) {
+		called++
+	}), WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	if err := timer.dispatch(context.Background(), Task{Key: "x", Kind: "missing", Payload: "{}", At: time.Unix(1, 0)}); err == nil {
+		t.Fatal("expected unknown kind")
+	}
+	if err := timer.dispatch(context.Background(), Task{Key: encodeTaskKey("sample", "x"), Kind: "sample", Payload: "not-json", At: time.Unix(2, 0)}); err == nil {
+		t.Fatal("expected decode fail")
+	}
+	if called != 0 {
+		t.Fatalf("called=%d", called)
+	}
+}
+
+func TestDispatchOnHandleErrorNotCalledOnAckFail(t *testing.T) {
+	store := &fakeStore{ackErr: errors.New("ack")}
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
+		t.Fatal("handler should not run")
+		return nil
+	})
+	called := 0
+	timer := New(store, WithHandlers(h), WithOnHandleError(func(context.Context, Params, error) {
+		called++
+	}), WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	if err := timer.dispatch(context.Background(), sampleTaskAt(time.Unix(1, 0))); err == nil {
+		t.Fatal("expected ack fail")
+	}
+	if called != 0 {
+		t.Fatalf("called=%d", called)
+	}
+}
+
+func TestDispatchOnHandleErrorUsesDispatchCtx(t *testing.T) {
+	store := &failIfCanceledStore{}
+	h := Bind(&sampleParams{}, func(ctx context.Context, _ *sampleParams) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	var cbErr error
+	var cbCtxErr error
+	timer := New(store, WithHandlers(h), WithHandleTimeout(20*time.Millisecond), WithFailPolicy(FailRequeue),
+		WithOnHandleError(func(ctx context.Context, _ Params, err error) {
+			cbErr = err
+			cbCtxErr = ctx.Err()
+		}), WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	err := timer.dispatch(context.Background(), sampleTaskAt(time.Unix(1, 0)))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v", err)
+	}
+	if !errors.Is(cbErr, context.DeadlineExceeded) {
+		t.Fatalf("cbErr=%v", cbErr)
+	}
+	if cbCtxErr != nil {
+		t.Fatalf("callback ctx should not be canceled: %v", cbCtxErr)
+	}
+	if store.canceledFail > 0 {
+		t.Fatal("Fail must not use the timed-out handle ctx")
+	}
+	_, _, _, failN := store.snapshot()
+	if failN != 1 {
+		t.Fatalf("fail=%d want 1", failN)
+	}
+}
+
+func TestDispatchOnHandleErrorPanicStillRequeues(t *testing.T) {
+	store := &fakeStore{}
+	cause := errors.New("boom")
+	h := Bind(&sampleParams{}, func(context.Context, *sampleParams) error {
+		return cause
+	})
+	timer := New(store, WithHandlers(h), WithFailPolicy(FailRequeue),
+		WithOnHandleError(func(context.Context, Params, error) {
+			panic("callback boom")
+		}), WithLogger(silentLogger()))
+	t.Cleanup(timer.Close)
+	err := timer.dispatch(context.Background(), sampleTaskAt(time.Unix(1, 0)))
+	if !errors.Is(err, cause) {
+		t.Fatalf("err=%v", err)
+	}
+	_, _, _, failN := store.snapshot()
+	if failN != 1 {
+		t.Fatalf("fail=%d want 1", failN)
+	}
+}

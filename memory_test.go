@@ -9,9 +9,8 @@ import (
 )
 
 func TestMemoryScheduleAndClaimDue(t *testing.T) {
-	now := time.Unix(1000, 0)
-	m := NewMemory(WithMemoryClock(func() time.Time { return now }))
-	task := Task{Key: "k1", Kind: "order", Payload: "p1", At: now.Add(-time.Second)}
+	m := NewMemory()
+	task := Task{Key: "k1", Kind: "order", Payload: "p1", At: time.Now().Add(-time.Second)}
 	if err := m.Schedule(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}
@@ -28,9 +27,8 @@ func TestMemoryScheduleAndClaimDue(t *testing.T) {
 }
 
 func TestMemoryClaimNotDueBlocksUntilCancel(t *testing.T) {
-	now := time.Unix(1000, 0)
-	m := NewMemory(WithMemoryClock(func() time.Time { return now }))
-	if err := m.Schedule(context.Background(), Task{Key: "k", Kind: "x", Payload: "p", At: now.Add(time.Hour)}); err != nil {
+	m := NewMemory()
+	if err := m.Schedule(context.Background(), Task{Key: "k", Kind: "x", Payload: "p", At: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
@@ -38,30 +36,6 @@ func TestMemoryClaimNotDueBlocksUntilCancel(t *testing.T) {
 	_, err := m.Claim(ctx, 1)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err=%v", err)
-	}
-}
-
-func TestMemoryClaimWhenDueBetweenClockReads(t *testing.T) {
-	at := time.Unix(10, 0)
-	var n int
-	m := NewMemory(WithMemoryClock(func() time.Time {
-		n++
-		if n == 1 {
-			return at.Add(-time.Nanosecond)
-		}
-		return at
-	}))
-	if err := m.Schedule(context.Background(), Task{Key: "k", Kind: "x", Payload: "p", At: at}); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	got, err := m.Claim(ctx, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 || got[0].Key != "k" {
-		t.Fatalf("got=%+v", got)
 	}
 }
 
@@ -83,13 +57,12 @@ func TestMemoryClaimWakesWhenTaskBecomesDue(t *testing.T) {
 }
 
 func TestMemoryScheduleOverwrite(t *testing.T) {
-	now := time.Unix(1000, 0)
-	m := NewMemory(WithMemoryClock(func() time.Time { return now }))
+	m := NewMemory()
 	ctx := context.Background()
-	if err := m.Schedule(ctx, Task{Key: "k", Kind: "x", Payload: "old", At: now.Add(time.Hour)}); err != nil {
+	if err := m.Schedule(ctx, Task{Key: "k", Kind: "x", Payload: "old", At: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Schedule(ctx, Task{Key: "k", Kind: "x", Payload: "new", At: now.Add(-time.Second)}); err != nil {
+	if err := m.Schedule(ctx, Task{Key: "k", Kind: "x", Payload: "new", At: time.Now().Add(-time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := m.Claim(ctx, 1)
@@ -102,10 +75,9 @@ func TestMemoryScheduleOverwrite(t *testing.T) {
 }
 
 func TestMemoryCancel(t *testing.T) {
-	now := time.Unix(1000, 0)
-	m := NewMemory(WithMemoryClock(func() time.Time { return now }))
+	m := NewMemory()
 	ctx := context.Background()
-	if err := m.Schedule(ctx, Task{Key: "k", Kind: "x", Payload: "p", At: now.Add(-time.Second)}); err != nil {
+	if err := m.Schedule(ctx, Task{Key: "k", Kind: "x", Payload: "p", At: time.Now().Add(-time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Cancel(ctx, "k"); err != nil {
@@ -120,11 +92,10 @@ func TestMemoryCancel(t *testing.T) {
 }
 
 func TestMemoryClaimBatchAndMinN(t *testing.T) {
-	now := time.Unix(1000, 0)
-	m := NewMemory(WithMemoryClock(func() time.Time { return now }))
+	m := NewMemory()
 	ctx := context.Background()
 	for i, key := range []string{"a", "b", "c"} {
-		if err := m.Schedule(ctx, Task{Key: key, Kind: "x", Payload: key, At: now.Add(-time.Duration(i) * time.Second)}); err != nil {
+		if err := m.Schedule(ctx, Task{Key: key, Kind: "x", Payload: key, At: time.Now().Add(-time.Duration(i+1) * time.Second)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -135,7 +106,7 @@ func TestMemoryClaimBatchAndMinN(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("len=%d", len(got))
 	}
-	if err := m.Schedule(ctx, Task{Key: "d", Kind: "x", Payload: "d", At: now.Add(-time.Second)}); err != nil {
+	if err := m.Schedule(ctx, Task{Key: "d", Kind: "x", Payload: "d", At: time.Now().Add(-time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	got, err = m.Claim(ctx, 0)
@@ -148,11 +119,9 @@ func TestMemoryClaimBatchAndMinN(t *testing.T) {
 }
 
 func TestMemoryFailRequeueAndNoOverwrite(t *testing.T) {
-	now := time.Unix(1000, 0)
-	clockNow := now
-	m := NewMemory(WithMemoryClock(func() time.Time { return clockNow }))
+	m := NewMemory()
 	ctx := context.Background()
-	task := Task{Key: "k", Kind: "x", Payload: "old", At: now.Add(-time.Second)}
+	task := Task{Key: "k", Kind: "x", Payload: "old", At: time.Now().Add(-time.Second)}
 	if err := m.Schedule(ctx, task); err != nil {
 		t.Fatal(err)
 	}
@@ -170,13 +139,14 @@ func TestMemoryFailRequeueAndNoOverwrite(t *testing.T) {
 		t.Fatalf("should not be due yet, err=%v", err)
 	}
 
-	clockNow = now.Add(failRequeueDelay)
-	got, err = m.Claim(ctx, 1)
+	wait, cancelWait := context.WithTimeout(ctx, failRequeueDelay+50*time.Millisecond)
+	got, err = m.Claim(wait, 1)
+	cancelWait()
 	if err != nil || len(got) != 1 || got[0].Payload != "old" {
 		t.Fatalf("requeue=%+v err=%v", got, err)
 	}
 
-	if err := m.Schedule(ctx, Task{Key: "k", Kind: "x", Payload: "new", At: clockNow.Add(-time.Second)}); err != nil {
+	if err := m.Schedule(ctx, Task{Key: "k", Kind: "x", Payload: "new", At: time.Now().Add(-time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Fail(ctx, got[0]); err != nil {

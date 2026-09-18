@@ -1,6 +1,7 @@
 package delaytimer
 
 import (
+	"context"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -29,6 +30,17 @@ type Option func(*Timer)
 func WithFailPolicy(p FailPolicy) Option {
 	return func(t *Timer) {
 		t.failPolicy = p
+	}
+}
+
+// WithOnHandleError Handler 返回错误后调用，与 FailPolicy 同范围（含超时）。
+// 未知 Kind / 解码失败 / Ack 失败不会调用。回调可能并发执行，调用方需自行保证安全。
+// 回调 panic 会被吞掉，不阻止后续 FailPolicy。fn 为 nil 时忽略。
+func WithOnHandleError(fn func(ctx context.Context, p Params, err error)) Option {
+	return func(t *Timer) {
+		if fn != nil {
+			t.onHandleError = fn
+		}
 	}
 }
 
