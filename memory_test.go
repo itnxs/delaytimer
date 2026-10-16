@@ -2,10 +2,10 @@ package delaytimer
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
 )
 
 func TestMemoryScheduleAndClaimDue(t *testing.T) {

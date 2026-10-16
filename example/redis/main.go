@@ -24,7 +24,7 @@ func main() {
 	}
 
 	handled := make(chan *OrderTimeout, 1)
-	timer := delaytimer.New(
+	timer := delaytimer.Must(
 		delaytimer.NewRedis(rdb, "delaytimer:jobs"),
 		delaytimer.WithHandlers(delaytimer.Bind(&OrderTimeout{}, func(_ context.Context, p *OrderTimeout) error {
 			handled <- p
@@ -39,11 +39,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := timer.SetEvent(time.Now().Add(-time.Second), &OrderTimeout{OrderID: "ok"}); err != nil {
+	if err := timer.SetEvent(context.Background(), time.Now().Add(-time.Second), &OrderTimeout{OrderID: "ok"}); err != nil {
 		log.Fatal(err)
 	}
 
-	if err := timer.SetEvent(time.Now(), &DemoTimeout{Time: time.Now().Unix()}); err != nil {
+	if err := timer.SetEvent(context.Background(), time.Now(), &DemoTimeout{Time: time.Now().Unix()}); err != nil {
 		log.Fatal(err)
 	}
 

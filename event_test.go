@@ -2,9 +2,9 @@ package delaytimer
 
 import (
 	"context"
+	"errors"
 	"testing"
 
-	"github.com/pkg/errors"
 )
 
 func TestBindHandleRoundTrip(t *testing.T) {

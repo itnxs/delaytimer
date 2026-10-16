@@ -25,7 +25,7 @@ _ = t.DelEvent(params)
 可选总线：
 
 ```go
-bus := delaytimer.NewBus() // 默认缓冲 2000，发布超时 3s
+bus := delaytimer.NewBus() // 默认缓冲 2000，发布超时 5s
 t := delaytimer.New(store, delaytimer.WithBus(bus), delaytimer.WithHandlers(...))
 _ = t.SetEvent(at, params) // 成功只表示进入通道，不保证已写入 Store
 ```
@@ -47,14 +47,16 @@ h := delaytimer.Bind(&OrderTimeout{}, func(ctx context.Context, p *OrderTimeout)
 
 `Bind` 的原型必须是指针。同一 `Event` 不能重复注册。
 
-Handler 返回错误时：
+Handler 返回错误或已解码后 panic 时：
 
 | 配置 | 行为 |
 |---|---|
-| 默认 / `WithFailPolicy(FailDiscard)` | 抛弃，打日志 |
+| 默认 / `WithFailPolicy(FailDiscard)` | 抛弃（仅配置 `WithLogger` 时记录日志） |
 | `WithFailPolicy(FailRequeue)` | 约 200ms 后重新入队 |
 
 未知 Kind、JSON 解码失败：**始终抛弃**，不走 FailPolicy。
+
+`WithOnHandleError` 在 Handler 返回错误后调用（与 FailPolicy 同范围，含超时和已解码后的 panic），传入解码后的 `Params` 和错误。未知 Kind / 解码失败 / Ack 失败不会调用。回调可能并发执行，调用方需自行保证安全；回调 panic 不阻止后续 FailPolicy。
 
 `WithHandleTimeout` 限制单条 Handle 最长执行时间（默认不限制）。超时后取消传给 Handler 的 ctx，再按上表 FailPolicy 处理。Handler 需要响应 `ctx` 才会在超时后返回。
 
@@ -136,11 +138,21 @@ Redis Claim 用该 Key 还原 Kind / Payload。AMQP 消息体里同时带 Key、
 |---|---|---|
 | `WithHandlers` | 无 | 注册到期 Handler |
 | `WithFailPolicy` | `FailDiscard` | 仅 Handler 失败：抛弃或重入队 |
+| `WithOnHandleError` | 无 | 仅 Handler 失败：回调 `(ctx, Params, error)`；可能并发；panic 不阻止 FailPolicy |
 | `WithBus` | 不启用 | `SetEvent` / `DelEvent` 走内存通道 |
 | `WithConcurrency` | 32 | 同时执行 Handle 的上限；领取与 Handle 重叠，不必等整批结束 |
 | `WithBatchSize` | 32 | 单次 Claim 条数 |
 | `WithPollInterval` | 200ms | Claim 无任务或失败后的等待。Redis 主要靠此项轮询 |
 | `WithHandleTimeout` | 不限制 | 单条 Handle 最长执行时间；超时后取消 Handler 的 ctx，再按 FailPolicy 处理。Handler 需响应 ctx |
-| `WithLogger` / `WithLogLevel` | stderr Info | 日志 |
+| `WithLogger` | 默认不记录 | 注入日志实现；未注入则不记录日志 |
 
-Bus 自身：`WithChannelSize`（默认 2000）、`WithTimeout`（默认 3s）。
+Bus 自身：`WithChannelSize`（默认 2000）、`WithTimeout`（默认 5s）。
+
+`WithLogger` 需要传入实现以下接口的对象：
+
+```go
+type Logger interface {
+    Info(ctx context.Context, msg string, args ...any)
+    Error(ctx context.Context, msg string, err error, args ...any)
+}
+```

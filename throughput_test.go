@@ -5,7 +5,6 @@ package delaytimer
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"runtime"
 	"sync"
@@ -15,7 +14,6 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
-	"github.com/sirupsen/logrus"
 )
 
 type benchParams struct {
@@ -25,7 +23,7 @@ type benchParams struct {
 func (p *benchParams) Event() Event { return "bench" }
 
 type throughputResult struct {
-	backend   string
+	backend    string
 	n          int
 	publishDur time.Duration
 	publishErr int
@@ -126,7 +124,7 @@ func runThroughput(t *testing.T, n, workers int, newStore func() (Store, func())
 	consDur := time.Since(startCons)
 
 	return throughputResult{
-		backend:   t.Name(),
+		backend:    t.Name(),
 		n:          n,
 		publishDur: pubDur,
 		publishErr: pubErr,
@@ -156,7 +154,7 @@ func publishN(timer *Timer, prefix string, n, workers int) int {
 			defer wg.Done()
 			for i := range ch {
 				p := &benchParams{ID: fmt.Sprintf("%s-%d", prefix, i)}
-				if err := timer.SetEvent(at, p); err != nil {
+				if err := timer.SetEvent(context.Background(), at, p); err != nil {
 					errN.Add(1)
 				}
 			}
@@ -174,9 +172,4 @@ func reportThroughput(t *testing.T, r throughputResult) {
 		r.backend, r.n, r.publishErr, r.publishDur.Seconds()*1000, pubRPS, r.consumeDur.Seconds()*1000, r.consumed, consRPS)
 }
 
-func discardLogger() logrus.FieldLogger {
-	l := logrus.New()
-	l.SetOutput(io.Discard)
-	l.SetLevel(logrus.ErrorLevel)
-	return l
-}
+func discardLogger() Logger { return noopLogger{} }

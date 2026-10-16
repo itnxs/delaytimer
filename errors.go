@@ -1,6 +1,6 @@
 package delaytimer
 
-import "github.com/pkg/errors"
+import "errors"
 
 var (
 	// ErrNilEventHandler Bind 或 WithHandlers 的 Handler 为空。

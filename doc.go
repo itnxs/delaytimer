@@ -9,7 +9,7 @@
 // 使用 WithBus 时只表示进入内存通道，真正写 Store 在订阅回调里，失败只打日志。
 //
 // Handler 失败默认抛弃（FailDiscard）；WithFailPolicy(FailRequeue) 时延迟约 200ms 重新入队。
-// WithOnHandleError 在 Handler 失败后调用（与 FailPolicy 同范围，含超时）；回调可能并发，panic 不阻止 FailPolicy。
+// WithOnHandleError 在 Handler 失败后调用（与 FailPolicy 同范围，含超时和已解码后的 panic）；回调可能并发，回调 panic 不阻止 FailPolicy。
 // WithHandleTimeout 限制单条 Handle 时长，超时后按 FailPolicy 处理；Handler 需响应 ctx。
 // 未知 Kind、载荷解码失败始终抛弃，不受 FailPolicy 影响。
 package delaytimer

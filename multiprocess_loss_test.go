@@ -42,10 +42,10 @@ func TestStoreMultiProcessLoss(t *testing.T) {
 func runMemorySingleProcessLoss(t *testing.T, n int) {
 	t.Helper()
 	var (
-		mu      sync.Mutex
-		cons    = make(map[string]int, n)
-		hits    atomic.Int64
-		pubErr  atomic.Int64
+		mu     sync.Mutex
+		cons   = make(map[string]int, n)
+		hits   atomic.Int64
+		pubErr atomic.Int64
 	)
 	timer := New(NewMemory(),
 		WithHandlers(Bind(&benchParams{}, func(_ context.Context, p *benchParams) error {
@@ -77,7 +77,7 @@ func runMemorySingleProcessLoss(t *testing.T, n int) {
 		go func() {
 			defer wg.Done()
 			for i := range ch {
-				if err := timer.SetEvent(at, &benchParams{ID: strconv.Itoa(i)}); err != nil {
+				if err := timer.SetEvent(context.Background(), at, &benchParams{ID: strconv.Itoa(i)}); err != nil {
 					pubErr.Add(1)
 				}
 			}
@@ -327,7 +327,7 @@ func lossProducer(t *testing.T) {
 	var errN int
 	for i := 0; i < count; i++ {
 		id := strconv.Itoa(start + i)
-		if err := timer.SetEvent(at, &benchParams{ID: id}); err != nil {
+		if err := timer.SetEvent(context.Background(), at, &benchParams{ID: id}); err != nil {
 			errN++
 			continue
 		}

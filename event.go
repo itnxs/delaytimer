@@ -2,10 +2,10 @@ package delaytimer
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 
 	jsoniter "github.com/json-iterator/go"
-	"github.com/pkg/errors"
 )
 
 // jsonAPI 字段顺序与结构体声明一致，保证 Cancel 身份稳定
@@ -44,13 +44,13 @@ type boundHandler[P Params] struct {
 // Bind 把参数原型和处理函数绑成 Handler。proto 必须是指针，供克隆后 JSON 解码。
 func Bind[P Params](proto P, handler func(context.Context, P) error) EventHandler {
 	if handler == nil {
-		panic(errors.Wrapf(ErrNilEventHandler, "%T", handler))
+		panic(fmt.Errorf("bind handler is nil (handler=%T): %w", handler, ErrNilEventHandler))
 	}
 	if !isPointerParams(proto) {
-		panic(errors.Wrapf(ErrNotPointerParams, "%T", proto))
+		panic(fmt.Errorf("bind proto must be pointer (proto=%T): %w", proto, ErrNotPointerParams))
 	}
 	if proto.Event().IsNil() {
-		panic(errors.WithStack(ErrEmptyEvent))
+		panic(ErrEmptyEvent)
 	}
 	return &boundHandler[P]{proto: proto, handler: handler}
 }
@@ -77,7 +77,7 @@ func (h *boundHandler[P]) NewParams() Params {
 func (h *boundHandler[P]) Handle(ctx context.Context, p Params) error {
 	t, ok := p.(P)
 	if !ok {
-		return errors.Wrapf(ErrParamsTypeMismatch, "want %T got %T", h.proto, p)
+		return fmt.Errorf("handle params type mismatch (want=%T got=%T): %w", h.proto, p, ErrParamsTypeMismatch)
 	}
 	return h.handler(ctx, t)
 }
@@ -92,7 +92,7 @@ func isPointerParams(p Params) bool {
 func encodeParams(p Params) (string, error) {
 	s, err := jsonAPI.MarshalToString(p)
 	if err != nil {
-		return "", errors.WithStack(err)
+		return "", err
 	}
 	return s, nil
 }
@@ -100,7 +100,7 @@ func encodeParams(p Params) (string, error) {
 // decodeParams 解码到已克隆的指针参数。失败时包装 ErrUnmarshalParams。
 func decodeParams(payload string, p Params) error {
 	if err := jsonAPI.UnmarshalFromString(payload, p); err != nil {
-		return errors.Wrap(ErrUnmarshalParams, err.Error())
+		return fmt.Errorf("decode params failed: %v: %w", err, ErrUnmarshalParams)
 	}
 	return nil
 }

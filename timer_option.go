@@ -3,8 +3,6 @@ package delaytimer
 import (
 	"context"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -33,7 +31,7 @@ func WithFailPolicy(p FailPolicy) Option {
 	}
 }
 
-// WithOnHandleError Handler 返回错误后调用，与 FailPolicy 同范围（含超时）。
+// WithOnHandleError Handler 返回错误后调用，与 FailPolicy 同范围（含超时和已解码后的 panic）。
 // 未知 Kind / 解码失败 / Ack 失败不会调用。回调可能并发执行，调用方需自行保证安全。
 // 回调 panic 会被吞掉，不阻止后续 FailPolicy。fn 为 nil 时忽略。
 func WithOnHandleError(fn func(ctx context.Context, p Params, err error)) Option {
@@ -62,22 +60,10 @@ func WithHandlers(handlers ...EventHandler) Option {
 }
 
 // WithLogger 设置 Logger
-func WithLogger(logger logrus.FieldLogger) Option {
+func WithLogger(logger Logger) Option {
 	return func(t *Timer) {
 		if logger != nil {
 			t.logger = logger
-		}
-	}
-}
-
-// WithLogLevel 设置当前 logger 级别
-func WithLogLevel(level logrus.Level) Option {
-	return func(t *Timer) {
-		switch x := t.logger.(type) {
-		case *logrus.Logger:
-			x.SetLevel(level)
-		case *logrus.Entry:
-			x.Logger.SetLevel(level)
 		}
 	}
 }

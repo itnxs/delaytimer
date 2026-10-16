@@ -2,10 +2,10 @@ package delaytimer
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cast"
 )
@@ -139,7 +139,7 @@ func tasksFromClaimEval(raw any) ([]Task, error) {
 	}
 	arr, ok := raw.([]any)
 	if !ok {
-		return nil, errors.Errorf("redis claim: unexpected type %T", raw)
+		return nil, fmt.Errorf("redis claim result type mismatch (got=%T)", raw)
 	}
 	output := make([]Task, 0, len(arr)/2)
 	for i := 0; i+1 < len(arr); i += 2 {

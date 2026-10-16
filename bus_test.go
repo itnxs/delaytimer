@@ -2,18 +2,18 @@ package delaytimer
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
 )
 
 func TestBusNilParams(t *testing.T) {
 	b := NewBus()
-	if err := b.SetEvent(time.Now(), nil); !errors.Is(err, ErrNilParam) {
+	if err := b.SetEvent(context.Background(), time.Now(), nil); !errors.Is(err, ErrNilParam) {
 		t.Fatalf("set=%v", err)
 	}
-	if err := b.DelEvent(nil); !errors.Is(err, ErrNilParam) {
+	if err := b.DelEvent(context.Background(), nil); !errors.Is(err, ErrNilParam) {
 		t.Fatalf("del=%v", err)
 	}
 }
@@ -61,9 +61,33 @@ func TestEventChannelCloseDoesNotWaitForPublish(t *testing.T) {
 	}
 }
 
+func TestEventChannelCloseFailsInFlightPublish(t *testing.T) {
+	ch := newEventChannel(1, 2*time.Second)
+	if err := ch.Publish("a"); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		close(started)
+		result <- ch.Publish("b")
+	}()
+	<-started
+	time.Sleep(30 * time.Millisecond)
+	ch.Close()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("in-flight publish must not succeed after Close")
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("in-flight publish did not return after Close")
+	}
+}
+
 func TestSubscribeNilSafe(t *testing.T) {
 	subscribe(nil, nil)
-	timer := New(&fakeStore{}, WithLogger(silentLogger()))
+	timer := Must(&fakeStore{}, WithLogger(silentLogger()))
 	t.Cleanup(timer.Close)
 	subscribe(timer, nil)
 }
@@ -71,9 +95,9 @@ func TestSubscribeNilSafe(t *testing.T) {
 func TestBusWithoutSubscribeDoesNotWriteStore(t *testing.T) {
 	store := &fakeStore{}
 	bus := NewBus()
-	timer := New(store, WithLogger(silentLogger()))
+	timer := Must(store, WithLogger(silentLogger()))
 	t.Cleanup(timer.Close)
-	if err := bus.SetEvent(time.Now(), &sampleParams{ID: "1"}); err != nil {
+	if err := bus.SetEvent(context.Background(), time.Now(), &sampleParams{ID: "1"}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -84,35 +108,47 @@ func TestBusWithoutSubscribeDoesNotWriteStore(t *testing.T) {
 }
 
 type routeBus struct {
-	setN int
-	delN int
+	setN   int
+	delN   int
+	setCtx context.Context
+	delCtx context.Context
 }
 
 func (b *routeBus) SetEvents() *EventChannel { return nil }
 func (b *routeBus) DelEvents() *EventChannel { return nil }
-func (b *routeBus) SetEvent(time.Time, Params) error {
+func (b *routeBus) SetEvent(ctx context.Context, _ time.Time, _ Params) error {
 	b.setN++
+	b.setCtx = ctx
 	return nil
 }
-func (b *routeBus) DelEvent(Params) error {
+func (b *routeBus) DelEvent(ctx context.Context, _ Params) error {
 	b.delN++
+	b.delCtx = ctx
 	return nil
 }
 
 func TestTimerSetEventUsesBusWhenConfigured(t *testing.T) {
 	store := &fakeStore{}
 	bus := &routeBus{}
-	timer := New(store, WithBus(bus), WithLogger(silentLogger()))
+	timer := Must(store, WithBus(bus), WithLogger(silentLogger()))
 	t.Cleanup(timer.Close)
 	p := &sampleParams{ID: "1"}
-	if err := timer.SetEvent(time.Unix(1000, 0), p); err != nil {
+	type traceKey struct{}
+	ctx := context.WithValue(context.Background(), traceKey{}, "route-bus")
+	if err := timer.SetEvent(ctx, time.Unix(1000, 0), p); err != nil {
 		t.Fatal(err)
 	}
-	if err := timer.DelEvent(p); err != nil {
+	if err := timer.DelEvent(ctx, p); err != nil {
 		t.Fatal(err)
 	}
 	if bus.setN != 1 || bus.delN != 1 {
 		t.Fatalf("set=%d del=%d", bus.setN, bus.delN)
+	}
+	if bus.setCtx == nil || bus.setCtx.Value(traceKey{}) != "route-bus" {
+		t.Fatalf("set ctx mismatch: %#v", bus.setCtx)
+	}
+	if bus.delCtx == nil || bus.delCtx.Value(traceKey{}) != "route-bus" {
+		t.Fatalf("del ctx mismatch: %#v", bus.delCtx)
 	}
 	scheduled, canceled, _, _ := store.snapshot()
 	if len(scheduled) != 0 || len(canceled) != 0 {
@@ -123,8 +159,8 @@ func TestTimerSetEventUsesBusWhenConfigured(t *testing.T) {
 func TestWithBusCloseWaitsForPersist(t *testing.T) {
 	store := &slowCloseStore{delay: 40 * time.Millisecond}
 	bus := NewBus()
-	timer := New(store, WithBus(bus), WithLogger(silentLogger()))
-	if err := timer.SetEvent(time.Unix(1000, 0), &sampleParams{ID: "1"}); err != nil {
+	timer := Must(store, WithBus(bus), WithLogger(silentLogger()))
+	if err := timer.SetEvent(context.Background(), time.Unix(1000, 0), &sampleParams{ID: "1"}); err != nil {
 		t.Fatal(err)
 	}
 	timer.Close()
@@ -170,11 +206,11 @@ func (s *slowCloseStore) closedAfterSchedule() bool {
 func TestWithBusSetEventWritesStoreEventually(t *testing.T) {
 	store := &fakeStore{}
 	bus := NewBus()
-	timer := New(store, WithBus(bus), WithLogger(silentLogger()))
+	timer := Must(store, WithBus(bus), WithLogger(silentLogger()))
 	t.Cleanup(timer.Close)
 	at := time.Unix(1000, 0)
 	p := &sampleParams{ID: "1"}
-	if err := timer.SetEvent(at, p); err != nil {
+	if err := timer.SetEvent(context.Background(), at, p); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, time.Second, func() bool {
@@ -190,8 +226,13 @@ func TestWithBusSetEventWritesStoreEventually(t *testing.T) {
 	if scheduled[0].Key != wantKey || scheduled[0].Kind != "sample" || scheduled[0].At != at {
 		t.Fatalf("task=%+v", scheduled[0])
 	}
+	if got := store.lastScheduleCtx(); got == nil {
+		t.Fatal("schedule ctx is nil")
+	} else if _, ok := got.Deadline(); !ok {
+		t.Fatal("schedule ctx should have deadline")
+	}
 
-	if err := timer.DelEvent(p); err != nil {
+	if err := timer.DelEvent(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, time.Second, func() bool {
@@ -201,5 +242,10 @@ func TestWithBusSetEventWritesStoreEventually(t *testing.T) {
 	_, canceled, _, _ := store.snapshot()
 	if canceled[0] != wantKey {
 		t.Fatalf("canceled=%v", canceled)
+	}
+	if got := store.lastCancelCtx(); got == nil {
+		t.Fatal("cancel ctx is nil")
+	} else if _, ok := got.Deadline(); !ok {
+		t.Fatal("cancel ctx should have deadline")
 	}
 }

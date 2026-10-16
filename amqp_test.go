@@ -3,12 +3,12 @@ package delaytimer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -133,13 +133,14 @@ type fakeAcknowledger struct {
 	acked   bool
 	nacked  bool
 	requeue bool
+	ackErr  error
 }
 
 func (a *fakeAcknowledger) Ack(uint64, bool) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.acked = true
-	return nil
+	return a.ackErr
 }
 
 func (a *fakeAcknowledger) Nack(_ uint64, _ bool, requeue bool) error {
@@ -552,6 +553,37 @@ func TestAMQPAckFail(t *testing.T) {
 
 	if err := a.Ack(context.Background(), Task{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAMQPClaimAckFailReturnsErrorAndNacks(t *testing.T) {
+	okAck := &fakeAcknowledger{}
+	failAck := &fakeAcknowledger{ackErr: errors.New("ack")}
+	deliveries := make(chan amqp.Delivery, 2)
+	deliveries <- amqp.Delivery{
+		Acknowledger: okAck,
+		Body:         []byte(`{"key":"a","kind":"order","payload":"{}","at":1}`),
+	}
+	deliveries <- amqp.Delivery{
+		Acknowledger: failAck,
+		Body:         []byte(`{"key":"b","kind":"order","payload":"{}","at":1}`),
+	}
+	a := amqpStore(&fakeAMQPChannel{deliveries: deliveries}, testAMQPConfig())
+	tasks, err := a.Claim(context.Background(), 2)
+	if err == nil {
+		t.Fatal("expected ack error")
+	}
+	if len(tasks) != 1 || tasks[0].Key != "a" {
+		t.Fatalf("tasks=%+v", tasks)
+	}
+	if tasks[0].ack != nil {
+		t.Fatal("acked task should drop handle")
+	}
+	failAck.mu.Lock()
+	nacked, requeue := failAck.nacked, failAck.requeue
+	failAck.mu.Unlock()
+	if !nacked || !requeue {
+		t.Fatalf("failed ack should nack requeue, nacked=%v requeue=%v", nacked, requeue)
 	}
 }
 

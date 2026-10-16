@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -138,10 +137,11 @@ func (a *AMQP) Claim(ctx context.Context, n int) ([]Task, error) {
 		}
 		// 领取后立刻 Ack，避免 Handle / 未知 Kind 失败占着 unack 堵住消费。
 		if err := ackClaimed(&task); err != nil {
+			_ = confirmAMQP(task, func(h ack) error { return h.Nack(true) })
 			if len(out) == 0 {
 				return nil, err
 			}
-			return out, nil
+			return out, err
 		}
 		out = append(out, task)
 	}
@@ -182,8 +182,11 @@ func ackClaimed(task *Task) error {
 		return nil
 	}
 	err := task.ack.Ack()
+	if err != nil {
+		return err
+	}
 	task.ack = nil
-	return err
+	return nil
 }
 
 // amqpTopology 路由与队列命名。
@@ -372,7 +375,7 @@ func (b *amqpBroker) source(t *amqpTopology) (amqpSource, error) {
 		return amqpSource{}, err
 	}
 	if ch == nil {
-		return amqpSource{}, errors.WithStack(ErrPublishFailed)
+		return amqpSource{}, ErrPublishFailed
 	}
 	b.msgCh = ch
 	return amqpSource{ch: ch}, nil
@@ -450,7 +453,7 @@ func (p amqpPublish) publishing() (amqp.Publishing, error) {
 		At:      p.task.At.UnixMilli(),
 	})
 	if err != nil {
-		return amqp.Publishing{}, errors.WithStack(err)
+		return amqp.Publishing{}, err
 	}
 	return amqp.Publishing{
 		Headers:      amqp.Table{"x-delay": p.delay.Milliseconds()},
@@ -505,7 +508,7 @@ type amqpReceipt struct {
 func (r amqpReceipt) decode() (Task, error) {
 	var msg amqpMessage
 	if err := json.Unmarshal(r.d.Body, &msg); err != nil {
-		return Task{}, errors.WithStack(err)
+		return Task{}, err
 	}
 	return msg.task(&amqpDeliveryAck{d: r.d}), nil
 }

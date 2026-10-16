@@ -2,13 +2,11 @@ package delaytimer
 
 import (
 	"context"
-	"io"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 type sampleParams struct {
@@ -29,28 +27,32 @@ type emptyEventParams struct{}
 func (p *emptyEventParams) Event() Event { return "" }
 
 type fakeStore struct {
-	mu         sync.Mutex
-	scheduled  []Task
-	canceled   []string
-	claims     []Task
-	ackN       int
-	failN      int
-	claimErr   error
-	ackErr     error
-	claimCalls int
+	mu           sync.Mutex
+	scheduled    []Task
+	canceled     []string
+	scheduleCtxs []context.Context
+	cancelCtxs   []context.Context
+	claims       []Task
+	ackN         int
+	failN        int
+	claimErr     error
+	ackErr       error
+	claimCalls   int
 }
 
-func (s *fakeStore) Schedule(_ context.Context, task Task) error {
+func (s *fakeStore) Schedule(ctx context.Context, task Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.scheduled = append(s.scheduled, task)
+	s.scheduleCtxs = append(s.scheduleCtxs, ctx)
 	return nil
 }
 
-func (s *fakeStore) Cancel(_ context.Context, key string) error {
+func (s *fakeStore) Cancel(ctx context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.canceled = append(s.canceled, key)
+	s.cancelCtxs = append(s.cancelCtxs, ctx)
 	return nil
 }
 
@@ -103,11 +105,30 @@ func (s *fakeStore) claimCount() int {
 	return s.claimCalls
 }
 
-func silentLogger() logrus.FieldLogger {
-	l := logrus.New()
-	l.SetOutput(io.Discard)
-	return l
+func (s *fakeStore) lastScheduleCtx() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.scheduleCtxs) == 0 {
+		return nil
+	}
+	return s.scheduleCtxs[len(s.scheduleCtxs)-1]
 }
+
+func (s *fakeStore) lastCancelCtx() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.cancelCtxs) == 0 {
+		return nil
+	}
+	return s.cancelCtxs[len(s.cancelCtxs)-1]
+}
+
+type noopLogger struct{}
+
+func (noopLogger) Info(context.Context, string, ...any)         {}
+func (noopLogger) Error(context.Context, string, error, ...any) {}
+
+func silentLogger() Logger { return noopLogger{} }
 
 func sampleTaskAt(at time.Time) Task {
 	payload, err := encodeParams(&sampleParams{ID: "1"})

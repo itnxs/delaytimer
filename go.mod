@@ -1,14 +1,12 @@
-module github.com/itnxs/delaytimer
+module gitlab.haochang.tv/gopkg/delaytimer
 
 go 1.25.4
 
 require (
 	github.com/json-iterator/go v1.1.12
-	github.com/pkg/errors v0.9.1
 	github.com/rabbitmq/amqp091-go v1.14.0
 	github.com/reactivex/rxgo/v2 v2.5.0
 	github.com/redis/go-redis/v9 v9.22.0
-	github.com/sirupsen/logrus v1.10.2
 	github.com/spf13/cast v1.10.0
 )
 
